@@ -1,0 +1,90 @@
+# config/experiment.yaml
+# Central configuration for all experiments.
+# Override individual fields on the CLI: --config key=value
+
+# ---------------------------------------------------------------------------
+# Model choices
+# ---------------------------------------------------------------------------
+t2i_model: stabilityai/stable-diffusion-2-1
+clip_model: laion/CLIP-ViT-H-14-laion2B-s32B-b79K   # matches SD 2.1 text encoder
+longclip_checkpoint: null  # local path to longclip-L.pt, or null to auto-download
+
+llada_model: GSAI-ML/LLaDA-8B-Instruct
+ollama_model: llama3.1
+ollama_base_url: http://localhost:11434
+ollama_timeout: 600         # seconds per inference call; increase if timing out on cold start
+
+# ---------------------------------------------------------------------------
+# Generation
+# ---------------------------------------------------------------------------
+sampling_steps: 50
+image_size: 768         # stabilityai/stable-diffusion-2-1 is a 768×768 v-pred model
+                        # (use 512 only if switching to stable-diffusion-2-1-base)
+
+# CFG scales swept in RQ3
+cfg_scales: [1.0, 3.0, 5.0, 7.5, 10.0]
+
+# Default CFG scale for RQ1, RQ2, RQ4 (mid-range to avoid extremes)
+default_cfg_scale: 7.5
+
+# ---------------------------------------------------------------------------
+# Encoders
+# ---------------------------------------------------------------------------
+encoders:
+  - clip
+  - longclip
+
+# ---------------------------------------------------------------------------
+# Pipelines (conditions in the 2x3 design)
+# ---------------------------------------------------------------------------
+pipelines:
+  - raw
+  - ar
+  - llada
+
+# ---------------------------------------------------------------------------
+# Seeds (five runs for variance estimation)
+# ---------------------------------------------------------------------------
+seeds: [42, 123, 456, 789, 1024]
+
+# ---------------------------------------------------------------------------
+# LLaDA generation hyperparameters
+# ---------------------------------------------------------------------------
+llada:
+  gen_length: 128
+  steps: 128
+  block_length: 32
+  temperature: 0.0
+  cfg_scale: 0.0
+  remasking: low_confidence
+
+# ---------------------------------------------------------------------------
+# Evaluation
+# ---------------------------------------------------------------------------
+clip_score_model: openai/clip-vit-large-patch14   # for CLIPScore metric
+vqa_model: Salesforce/blip2-flan-t5-xl            # for attribute binding + relation accuracy
+fid_dims: 2048            # Inception feature dimensionality
+
+# Number of images per prompt per condition (for FID / variance)
+n_images_per_prompt: 5
+
+# Prompt sets to evaluate (must match keys in prompts.yaml)
+# color_binding / shape_binding / texture_binding / spatial_relations / non_spatial
+# are real T2I-CompBench++ validation sets; cats_dogs is a custom auxiliary set.
+eval_prompt_sets:
+  rq1: [color_binding, shape_binding, texture_binding, spatial_relations]
+  rq2: [color_binding, shape_binding, texture_binding, spatial_relations, non_spatial, cats_dogs]
+  rq3: [rq3_sweep]   # 25-prompt representative sample, swept over cfg_scales
+  rq4: [color_binding, spatial_relations, cats_dogs]
+
+# ---------------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------------
+output_dir: outputs/
+checkpoint_dir: checkpoints/
+
+# ---------------------------------------------------------------------------
+# Experiment tracking
+# ---------------------------------------------------------------------------
+wandb_project: prompt-pipeline
+wandb_offline: false    # set true on HPC without internet

@@ -1,0 +1,58 @@
+# ============================================================
+# requirements.txt
+# Python 3.10+  |  CUDA 12.1 recommended (also tested on 11.8)
+# ============================================================
+#
+# CUDA-enabled PyTorch — install BEFORE the rest of this file:
+#
+#   CUDA 12.1:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+#
+#   CUDA 11.8:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
+#
+#   CPU-only (development / no GPU):
+#   pip install torch torchvision
+#
+# Then install everything else:
+#   pip install -r requirements.txt
+# ============================================================
+
+# Core ML
+transformers==4.38.2          # pinned — required by LLaDA-8B-Instruct
+accelerate>=0.27.0            # required by diffusers and transformers device_map
+diffusers>=0.27.0             # T2I backbone (Stable Diffusion 2.1)
+safetensors>=0.4.2            # fast weight loading for HF models
+
+# CLIP / Long-CLIP
+open-clip-torch>=2.24.0       # optional: used if you swap to open_clip encoders
+
+# Hugging Face Hub (model downloads)
+huggingface-hub>=0.21.0
+
+# LLaDA dependencies
+numpy>=1.24.0
+
+# Ollama AR rewriter
+requests>=2.31.0
+
+# Image processing
+Pillow>=10.0.0
+
+# Evaluation
+scipy>=1.11.0                 # FID computation
+torchmetrics>=1.3.0           # CLIPScore, FID wrappers
+lpips>=0.1.4                  # perceptual similarity (optional)
+
+# Experiment tracking
+wandb>=0.16.0
+
+# Config
+PyYAML>=6.0.1
+
+# Utilities
+tqdm>=4.66.0
+einops>=0.7.0                 # tensor rearrangement (used by some eval modules)
+
+# Development
+pytest>=8.0.0

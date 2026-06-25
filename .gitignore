@@ -1,0 +1,86 @@
+# ============================================================
+# .gitignore — diffusion-based prompt pipeline
+# ============================================================
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+
+# Virtual environments
+venv/
+.venv/
+env/
+.env/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# ---- Model checkpoints & weights ----
+# Keep config/model references but not the weights themselves
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.gguf
+checkpoints/
+weights/
+
+# Hugging Face cache (can be large)
+.cache/
+~/.cache/huggingface/
+
+# ---- Experiment outputs ----
+outputs/
+results/
+generated_images/
+logs/
+runs/
+
+# ---- Weights & Biases ----
+wandb/
+.wandb/
+
+# ---- Data ----
+data/
+datasets/
+*.csv
+*.parquet
+*.arrow
+*.jsonl
+
+# ---- HPC / SLURM ----
+*.out
+*.err
+slurm-*.out
+__pycache__/
+
+# ---- OS ----
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# ---- IDE ----
+.vscode/
+.idea/
+*.code-workspace
+
+# ---- Secrets / credentials ----
+.env
+secrets.yaml
+*.key
+
+# ---- Misc ----
+*.log
+tmp/
+temp/
