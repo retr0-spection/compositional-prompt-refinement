@@ -217,6 +217,18 @@ class LLaDARewriter(PromptRewriter):
             return
 
         cfg = self.config
+
+        # Resolve device — LLaDA can technically run on CPU but 128 forward
+        # passes through an 8B model takes hours. Warn loudly if CUDA is absent.
+        if cfg.device == "cuda" and not torch.cuda.is_available():
+            logger.warning(
+                "CUDA not available — loading LLaDA on CPU. "
+                "Expect extremely slow inference (hours per prompt). "
+                "This is only suitable for debugging, not experiments."
+            )
+            cfg.device = "cpu"
+            cfg.torch_dtype = torch.float32   # bfloat16 support is limited on CPU
+
         logger.info("Loading LLaDA tokenizer from %s", cfg.model_id)
         tokenizer = AutoTokenizer.from_pretrained(
             cfg.model_id, trust_remote_code=True
@@ -369,5 +381,6 @@ class LLaDARewriter(PromptRewriter):
         """Release GPU memory. Call between experiment phases if needed."""
         self._model = None
         self._tokenizer = None
-        torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         logger.info("LLaDA model unloaded.")

@@ -42,7 +42,11 @@ logger = logging.getLogger(__name__)
 
 def _resolve_device(device: str) -> str:
     if device == "cuda" and not torch.cuda.is_available():
-        logger.warning("CUDA not available — falling back to CPU. Generation will be slow.")
+        logger.warning(
+            "CUDA not available — falling back to CPU. "
+            "SD 2.1 generation will be extremely slow on CPU (~minutes per image). "
+            "This is only suitable for debugging, not experiments."
+        )
         return "cpu"
     return device
 
@@ -144,12 +148,19 @@ class T2IRunner:
         device = _resolve_device(cfg.device)
         self._device = device
 
-        logger.info("Loading SD 2.1 pipeline from %s", cfg.model_id)
+        # float16 is not supported on CPU by diffusers — fall back to float32
+        dtype = cfg.torch_dtype
+        if device == "cpu" and dtype == torch.float16:
+            logger.warning("float16 is not supported on CPU — using float32 for SD 2.1.")
+            dtype = torch.float32
+
+        logger.info("Loading SD 2.1 pipeline from %s (device=%s, dtype=%s)",
+                    cfg.model_id, device, dtype)
         from diffusers import StableDiffusionPipeline
 
         self._pipe = StableDiffusionPipeline.from_pretrained(
             cfg.model_id,
-            torch_dtype=cfg.torch_dtype,
+            torch_dtype=dtype,
         ).to(device)
 
         # Disable the internal safety checker for research use

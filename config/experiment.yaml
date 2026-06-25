@@ -32,7 +32,7 @@ default_cfg_scale: 7.5
 # ---------------------------------------------------------------------------
 encoders:
   - clip
-  - longclip
+  # - longclip  # re-enable after fine-tuning EmbeddingProjector (768→1024, 248→77)
 
 # ---------------------------------------------------------------------------
 # Pipelines (conditions in the 2x3 design)

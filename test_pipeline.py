@@ -278,13 +278,23 @@ def _run_quick_check() -> None:
         print(f"  OUT: {expanded}")
     else:
         print("[Ollama] Server not running — skipping AR rewriter test.")
-        print("         Start with: ollama serve && ollama pull llama3")
+        print("         Start with: ollama serve")
 
     if _cuda_available():
         print(f"\n[CUDA] Device available: {torch.cuda.get_device_name(0)}")
-        print("       LLaDA rewriter is ready to use.")
+        print("\n[LLaDA] Testing rewriter (requires ~16 GB VRAM, may take a minute)...")
+        from rewriters.llada_rewriter import LLaDARewriter
+        try:
+            rw = LLaDARewriter()
+            expanded = rw.rewrite(prompt)
+            print(f"  IN:  {prompt}")
+            print(f"  OUT: {expanded}")
+            rw.unload()
+        except Exception as exc:
+            print(f"  [FAIL] LLaDA rewriter error: {exc}")
     else:
-        print("\n[CUDA] Not available — LLaDA rewriter will not run.")
+        print("\n[CUDA] Not available — skipping LLaDA rewriter test.")
+        print("         LLaDA requires a CUDA GPU (~16 GB VRAM).")
 
 
 if __name__ == "__main__":
