@@ -27,6 +27,32 @@ from PIL import Image
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Module-level BLIP-2 cache — shared between AttributeBindingScorer and
+# RelationAccuracyScorer so the same ~8 GB checkpoint is only loaded once.
+# ---------------------------------------------------------------------------
+_BLIP2_CACHE: dict[tuple, tuple] = {}   # (model_id, device) → (processor, model)
+
+
+def _get_blip2(model_name_or_path: str, device: str):
+    """Return a cached (processor, model) pair for BLIP-2, loading if needed."""
+    key = (model_name_or_path, device)
+    if key not in _BLIP2_CACHE:
+        from transformers import Blip2ForConditionalGeneration, Blip2Processor
+        logger.info("Loading BLIP-2 from %s (device=%s)", model_name_or_path, device)
+        dtype = torch.float16 if device != "cpu" else torch.float32
+        processor = Blip2Processor.from_pretrained(model_name_or_path)
+        model = (
+            Blip2ForConditionalGeneration.from_pretrained(
+                model_name_or_path, torch_dtype=dtype
+            )
+            .to(device)
+            .eval()
+        )
+        _BLIP2_CACHE[key] = (processor, model)
+        logger.info("BLIP-2 cached for key %s", key)
+    return _BLIP2_CACHE[key]
+
 
 # ---------------------------------------------------------------------------
 # CLIPScore
@@ -62,9 +88,10 @@ class CLIPScorer:
             return
         from transformers import CLIPModel, CLIPProcessor
         logger.info("Loading CLIP for CLIPScore from %s", self.model_name_or_path)
+        dtype = torch.float16 if self.device != "cpu" else torch.float32
         self._processor = CLIPProcessor.from_pretrained(self.model_name_or_path)
         self._model = CLIPModel.from_pretrained(
-            self.model_name_or_path, torch_dtype=torch.float16
+            self.model_name_or_path, torch_dtype=dtype
         ).to(self.device).eval()
 
     @torch.no_grad()
@@ -323,19 +350,14 @@ class AttributeBindingScorer:
     def _load(self) -> None:
         if self._model is not None:
             return
-        from transformers import Blip2ForConditionalGeneration, Blip2Processor
-        logger.info("Loading BLIP-2 from %s for VQA scoring", self.model_name_or_path)
-        self._processor = Blip2Processor.from_pretrained(self.model_name_or_path)
-        self._model = Blip2ForConditionalGeneration.from_pretrained(
-            self.model_name_or_path,
-            torch_dtype=torch.float16,
-        ).to(self.device).eval()
+        self._processor, self._model = _get_blip2(self.model_name_or_path, self.device)
 
     @torch.no_grad()
     def _vqa(self, image: Image.Image, question: str) -> str:
         self._load()
+        dtype = torch.float16 if self.device != "cpu" else torch.float32
         inputs = self._processor(images=image, text=question, return_tensors="pt").to(
-            self.device, dtype=torch.float16
+            self.device, dtype=dtype
         )
         out = self._model.generate(**inputs, max_new_tokens=20)
         return self._processor.decode(out[0], skip_special_tokens=True).strip().lower()
@@ -410,19 +432,14 @@ class RelationAccuracyScorer:
     def _load(self) -> None:
         if self._model is not None:
             return
-        from transformers import Blip2ForConditionalGeneration, Blip2Processor
-        logger.info("Loading BLIP-2 for relation accuracy scoring")
-        self._processor = Blip2Processor.from_pretrained(self.model_name_or_path)
-        self._model = Blip2ForConditionalGeneration.from_pretrained(
-            self.model_name_or_path,
-            torch_dtype=torch.float16,
-        ).to(self.device).eval()
+        self._processor, self._model = _get_blip2(self.model_name_or_path, self.device)
 
     @torch.no_grad()
     def _vqa(self, image: Image.Image, question: str) -> str:
         self._load()
+        dtype = torch.float16 if self.device != "cpu" else torch.float32
         inputs = self._processor(images=image, text=question, return_tensors="pt").to(
-            self.device, dtype=torch.float16
+            self.device, dtype=dtype
         )
         out = self._model.generate(**inputs, max_new_tokens=20)
         return self._processor.decode(out[0], skip_special_tokens=True).strip().lower()

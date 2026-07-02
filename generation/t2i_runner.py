@@ -101,8 +101,8 @@ class T2IRunnerConfig:
     # Sampling defaults (overridable per call)
     num_inference_steps: int = 50
     default_cfg_scale: float = 7.5
-    image_height: int = 512
-    image_width: int = 512
+    image_height: int = 768   # SD 2.1 is a 768×768 v-prediction model
+    image_width: int = 768    # (use 512 only for stable-diffusion-2-1-base)
 
     # Set True if passing LongCLIP embeddings (requires projection layer)
     project_embeds: bool = False

@@ -73,10 +73,18 @@ def run_rq2(
 
     all_results: dict[str, dict] = {}
 
-    # Optionally feed reference images into FID scorer
-    if fid_scorer and reference_images:
-        logger.info("Loading %d reference images into FID scorer", len(reference_images))
-        fid_scorer.update_real(reference_images)
+    # FID reference strategy:
+    # If reference_images are explicitly provided, use them for all pipelines.
+    # Otherwise, on the first pipeline pass (typically raw_clip), we collect
+    # its generated images as the FID reference distribution for all subsequent
+    # pipelines. This gives us relative FID (vs raw) rather than absolute FID
+    # (vs COCO), which is still a valid ablation signal.
+    _fid_reference: Optional[list[Image.Image]] = reference_images
+    _raw_pipeline_images: list[Image.Image] = []
+
+    if fid_scorer and _fid_reference:
+        logger.info("Loading %d explicit reference images into FID scorer", len(_fid_reference))
+        fid_scorer.update_real(_fid_reference)
 
     for pipeline in pipelines:
         logger.info("[RQ2] Pipeline: %s | CFG=%.1f | Seed=%d", pipeline.name, cfg_scale, seed)
@@ -103,6 +111,10 @@ def run_rq2(
             for i, (img, prompt) in enumerate(zip(images, prompts)):
                 img.save(img_dir / f"prompt_{i:03d}.png")
 
+            # Collect raw pipeline images as FID reference (first pipeline only)
+            if fid_scorer and _fid_reference is None:
+                _raw_pipeline_images.extend(images)
+
             # Score
             result = score_all(
                 pipeline_name=pipeline.name,
@@ -113,14 +125,12 @@ def run_rq2(
                 rel_scorer=rel_scorer,
             )
 
-            # FID
-            if fid_scorer:
+            # FID — only score non-raw pipelines (comparing against raw baseline)
+            if fid_scorer and _fid_reference is not None:
                 fid_scorer.update_generated(images)
                 result.fid = fid_scorer.compute()
                 fid_scorer.reset()
-                # Re-feed real images for next pipeline
-                if reference_images:
-                    fid_scorer.update_real(reference_images)
+                fid_scorer.update_real(_fid_reference)
 
             metrics = {
                 f"{pipeline.name}/{set_name}/clip_score": result.clip_score,
@@ -143,6 +153,17 @@ def run_rq2(
             )
 
         all_results[pipeline.name] = pipeline_results
+
+        # After the first pipeline completes, promote its images to FID reference
+        # so all subsequent pipelines are scored relative to raw output.
+        if fid_scorer and _fid_reference is None and _raw_pipeline_images:
+            _fid_reference = list(_raw_pipeline_images)
+            _raw_pipeline_images.clear()
+            logger.info(
+                "Using %d images from '%s' as FID reference for remaining pipelines.",
+                len(_fid_reference), pipeline.name,
+            )
+            fid_scorer.update_real(_fid_reference)
 
     _save_summary(all_results, output_dir / "rq2_summary.txt")
     return all_results
