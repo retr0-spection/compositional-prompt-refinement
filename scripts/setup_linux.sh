@@ -62,7 +62,7 @@ echo "============================================================"
 # ---------------------------------------------------------------------------
 if [[ ! -d venv ]]; then
     echo ""
-    echo "[1/5] Creating virtual environment with Python 3.12..."
+    echo "[1/7] Creating virtual environment with Python 3.12..."
     if command -v python3.12 &>/dev/null; then
         python3.12 -m venv venv
     else
@@ -73,7 +73,7 @@ if [[ ! -d venv ]]; then
     fi
 else
     echo ""
-    echo "[1/5] Virtual environment already exists — skipping creation."
+    echo "[1/7] Virtual environment already exists — skipping creation."
 fi
 
 source venv/bin/activate
@@ -82,7 +82,7 @@ source venv/bin/activate
 # 2. PyTorch
 # ---------------------------------------------------------------------------
 echo ""
-echo "[2/5] Installing PyTorch ($CUDA_TAG)..."
+echo "[2/7] Installing PyTorch ($CUDA_TAG)..."
 if [[ "$CUDA_TAG" == "cpu" ]]; then
     pip install --quiet torch torchvision
 else
@@ -103,14 +103,14 @@ PYCHECK
 # 3. pip dependencies
 # ---------------------------------------------------------------------------
 echo ""
-echo "[3/5] Installing dependencies from requirements.txt..."
+echo "[3/7] Installing dependencies from requirements.txt..."
 pip install --quiet -r requirements.txt
 
 # ---------------------------------------------------------------------------
 # 4. Ollama (AR baseline)
 # ---------------------------------------------------------------------------
 echo ""
-echo "[4/5] Installing Ollama..."
+echo "[4/7] Installing Ollama..."
 if command -v ollama &>/dev/null; then
     echo "  Ollama already installed: $(ollama --version 2>/dev/null || echo 'unknown version')"
 else
@@ -134,7 +134,7 @@ ollama pull llama3.1
 # 5. W&B API key
 # ---------------------------------------------------------------------------
 echo ""
-echo "[5/5] Weights & Biases setup..."
+echo "[5/7] Weights & Biases setup..."
 if [[ -f .env ]] && grep -q "WANDB_API_KEY" .env; then
     echo "  W&B API key already set in .env — skipping."
 else
@@ -150,11 +150,41 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 6. Smoke test
+# 6. Hugging Face login
+# ---------------------------------------------------------------------------
+echo ""
+echo "[6/7] Hugging Face setup..."
+# Load .env so we can check for an existing token
+set -a; [[ -f .env ]] && source .env; set +a
+
+if [[ -n "${HF_TOKEN:-}" ]]; then
+    echo "  HF_TOKEN found in .env — logging in..."
+    huggingface-cli login --token "$HF_TOKEN" --add-to-git-credential 2>/dev/null \
+        && echo "  HF login OK." \
+        || echo "  WARNING: huggingface-cli login failed — check your token."
+else
+    read -rp "  Enter your HuggingFace token (from huggingface.co/settings/tokens, leave blank to skip): " HF_KEY
+    if [[ -n "$HF_KEY" ]]; then
+        # Persist to .env
+        if grep -q "^HF_TOKEN=" .env 2>/dev/null; then
+            sed -i "s|^HF_TOKEN=.*|HF_TOKEN=${HF_KEY}|" .env
+        else
+            echo "HF_TOKEN=${HF_KEY}" >> .env
+        fi
+        huggingface-cli login --token "$HF_KEY" --add-to-git-credential 2>/dev/null \
+            && echo "  HF login OK — token saved to .env" \
+            || echo "  WARNING: login failed — check your token."
+    else
+        echo "  Skipping HF login. Public models will still download; gated models will fail."
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+# 7. Smoke test
 # ---------------------------------------------------------------------------
 echo ""
 echo "Running smoke test..."
-# Load env vars
+# Reload env vars (token may have just been written)
 set -a; [[ -f .env ]] && source .env; set +a
 
 python test_pipeline.py

@@ -184,6 +184,7 @@ class LLaDARewriterConfig:
     remasking: str = "low_confidence"
 
     expansion_instruction: str = _EXPANSION_INSTRUCTION
+    cache_path: Optional[str] = None  # path to rewrite cache JSON file
 
 
 # ---------------------------------------------------------------------------
@@ -207,6 +208,27 @@ class LLaDARewriter(PromptRewriter):
         self.config = config or LLaDARewriterConfig()
         self._model: Optional[AutoModel] = None
         self._tokenizer: Optional[AutoTokenizer] = None
+        self._cache: dict[str, str] = {}
+        if self.config.cache_path:
+            self._load_cache()
+
+    def _load_cache(self) -> None:
+        import json
+        from pathlib import Path
+        p = Path(self.config.cache_path)
+        if p.exists():
+            with open(p) as f:
+                self._cache = json.load(f)
+            logger.info("Loaded %d cached LLaDA rewrites from %s", len(self._cache), p)
+
+    def _save_cache(self) -> None:
+        import json
+        from pathlib import Path
+        p = Path(self.config.cache_path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with open(p, "w") as f:
+            json.dump(self._cache, f, indent=2)
+        logger.debug("LLaDA cache saved (%d entries) → %s", len(self._cache), p)
 
     # ------------------------------------------------------------------
     # Lazy loader
@@ -281,6 +303,10 @@ class LLaDARewriter(PromptRewriter):
         str
             Expanded prompt produced by LLaDA's masked diffusion process.
         """
+        if prompt in self._cache:
+            logger.debug("LLaDA cache hit for prompt: %r", prompt[:60])
+            return self._cache[prompt]
+
         self._load()
         cfg = self.config
 
@@ -321,6 +347,9 @@ class LLaDARewriter(PromptRewriter):
         )[0].strip()
 
         logger.debug("LLaDA expanded %r -> %r", prompt, expanded)
+        self._cache[prompt] = expanded
+        if self.config.cache_path:
+            self._save_cache()
         return expanded
 
     def rewrite_batch(self, prompts: list[str]) -> list[str]:

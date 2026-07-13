@@ -5,7 +5,7 @@
 # ---------------------------------------------------------------------------
 # Model choices
 # ---------------------------------------------------------------------------
-t2i_model: stabilityai/stable-diffusion-2-1
+t2i_model: sd2-community/stable-diffusion-2-1
 clip_model: laion/CLIP-ViT-H-14-laion2B-s32B-b79K   # matches SD 2.1 text encoder
 longclip_checkpoint: null  # local path to longclip-L.pt, or null to auto-download
 
@@ -82,9 +82,13 @@ eval_prompt_sets:
 # ---------------------------------------------------------------------------
 output_dir: outputs/
 checkpoint_dir: checkpoints/
+# Rewrite cache: stores prompt→rewrite mappings so all RQs share the same
+# rewrites and the LLM is only called once per unique prompt.
+# Keyed by rewriter so AR and LLaDA caches are separate.
+rewrite_cache_dir: outputs/rewrite_cache/
 
 # ---------------------------------------------------------------------------
 # Experiment tracking
 # ---------------------------------------------------------------------------
-wandb_project: prompt-pipeline
+wandb_project: Diffusion_Refinement
 wandb_offline: false    # set true on HPC without internet

@@ -11,6 +11,7 @@ Both use the same encoder to isolate the generative mechanism as the variable.
 
 from __future__ import annotations
 
+import json
 import logging
 from pathlib import Path
 from typing import Optional
@@ -73,10 +74,10 @@ def run_rq4(
             logger.info("[RQ4][%s] Processing '%s' (%d prompts)",
                         pipeline.name, set_name, len(prompts))
 
-            encoding_results = pipeline.encode_batch(prompts)
-            embeddings = [r.embedding for r in encoding_results]
-            raw_prompts = [r.raw_prompt for r in encoding_results]
-            rewritten_prompts = [r.rewritten_prompt for r in encoding_results]
+            enc_results = pipeline.encode_batch(prompts)
+            embeddings  = [r.embedding for r in enc_results]
+            raw_prompts = [r.raw_prompt for r in enc_results]
+            rewritten_prompts = [r.rewritten_prompt for r in enc_results]
 
             # Expansion quality: semantic density
             density_stats = analyse_semantic_density(
@@ -98,21 +99,39 @@ def run_rq4(
             for i, img in enumerate(images):
                 img.save(img_dir / f"prompt_{i:03d}.png")
 
-            # Score
-            eval_result = score_all(
-                pipeline_name=pipeline.name,
-                images=images,
-                prompts=prompts,
-                clip_scorer=clip_scorer,
-                attr_scorer=attr_scorer,
-                rel_scorer=rel_scorer,
-            )
+            # Per-prompt scoring + trace
+            clip_scores, attr_accs, rel_accs = [], [], []
+            trace_records = []
+            for i, (img, prompt, enc) in enumerate(zip(images, prompts, enc_results)):
+                clip_s = clip_scorer.score(img, prompt)
+                attr_r = attr_scorer.score(img, prompt)
+                rel_r  = rel_scorer.score(img, prompt)
+                clip_scores.append(clip_s)
+                attr_accs.append(attr_r["accuracy"])
+                rel_accs.append(rel_r["accuracy"])
+                trace_records.append({
+                    "idx": i,
+                    "pipeline": pipeline.name,
+                    "mechanism": mechanism,
+                    "set": set_name,
+                    "raw_prompt": enc.raw_prompt,
+                    "rewritten_prompt": enc.rewritten_prompt,
+                    "token_count_raw": enc.token_count_raw,
+                    "token_count_rewritten": enc.token_count_rewritten,
+                    "was_truncated": enc.was_truncated,
+                    "image_path": str(img_dir / f"prompt_{i:03d}.png"),
+                    "clip_score": clip_s,
+                    "attr_binding": attr_r,
+                    "relation_accuracy": rel_r,
+                })
+            _write_trace(trace_records, img_dir / "trace.jsonl")
 
+            n = len(prompts) or 1
             key = f"{pipeline.name}/{set_name}"
             metrics = {
-                f"{key}/clip_score": eval_result.clip_score,
-                f"{key}/attr_binding_accuracy": eval_result.attr_binding_accuracy,
-                f"{key}/relation_accuracy": eval_result.relation_accuracy,
+                f"{key}/clip_score": sum(clip_scores) / n,
+                f"{key}/attr_binding_accuracy": sum(attr_accs) / n,
+                f"{key}/relation_accuracy": sum(rel_accs) / n,
                 **density_stats,
             }
             results[mechanism].setdefault(pipeline.name, {})[set_name] = metrics
@@ -123,9 +142,9 @@ def run_rq4(
             logger.info(
                 "[RQ4][%s][%s] CLIP=%.4f | Attr=%.4f | Rel=%.4f",
                 pipeline.name, set_name,
-                eval_result.clip_score,
-                eval_result.attr_binding_accuracy,
-                eval_result.relation_accuracy,
+                metrics[f"{key}/clip_score"],
+                metrics[f"{key}/attr_binding_accuracy"],
+                metrics[f"{key}/relation_accuracy"],
             )
 
     # Head-to-head comparison: AR vs LLaDA per encoder
@@ -136,6 +155,13 @@ def run_rq4(
 
     _save_summary(results, output_dir / "rq4_summary.txt")
     return results
+
+
+def _write_trace(records: list[dict], path: Path) -> None:
+    with open(path, "w") as f:
+        for record in records:
+            f.write(json.dumps(record, default=str) + "\n")
+    logger.debug("Trace written to %s (%d records)", path, len(records))
 
 
 def _compare_mechanisms(

@@ -94,7 +94,7 @@ class EmbeddingProjector(nn.Module):
 
 @dataclass
 class T2IRunnerConfig:
-    model_id: str = "stabilityai/stable-diffusion-2-1"
+    model_id: str = "sd2-community/stable-diffusion-2-1"
     device: str = "cuda"
     torch_dtype: torch.dtype = torch.float16
 
@@ -156,12 +156,23 @@ class T2IRunner:
 
         logger.info("Loading SD 2.1 pipeline from %s (device=%s, dtype=%s)",
                     cfg.model_id, device, dtype)
-        from diffusers import StableDiffusionPipeline
+        from diffusers import StableDiffusionPipeline, DPMSolverMultistepScheduler
 
         self._pipe = StableDiffusionPipeline.from_pretrained(
             cfg.model_id,
             torch_dtype=dtype,
         ).to(device)
+
+        # SD 2.1 is a v-prediction model. Community repos sometimes omit
+        # prediction_type from scheduler_config.json, causing the default
+        # epsilon-prediction scheduler to produce blurry incoherent output.
+        # Force DPMSolverMultistepScheduler with v_prediction explicitly.
+        self._pipe.scheduler = DPMSolverMultistepScheduler.from_config(
+            self._pipe.scheduler.config,
+            prediction_type="v_prediction",
+            use_karras_sigmas=True,
+        )
+        logger.info("Scheduler set to DPMSolverMultistep (v_prediction, karras sigmas).")
 
         # Disable the internal safety checker for research use
         self._pipe.safety_checker = None

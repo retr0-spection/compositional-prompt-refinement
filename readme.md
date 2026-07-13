@@ -2,7 +2,7 @@
 
 Empirical investigation into whether diffusion-based prompt refinement produces more compositionally faithful conditioning signals for text-to-image generation than raw prompting or autoregressive rewriting.
 
-Based on the MSc research proposal by Oratile Nailana, University of the Witwatersrand, supervised by Dr. Devon Jarvis.
+MSc research by Oratile Nailana, University of the Witwatersrand, supervised by Dr. Devon Jarvis.
 
 ---
 
@@ -10,24 +10,26 @@ Based on the MSc research proposal by Oratile Nailana, University of the Witwate
 
 Text-to-image diffusion models are sensitive to prompt quality. Natural language prompts are often underspecified, leading to attribute misbinding, relational inconsistencies, and object entanglement in generated images. This project evaluates whether refining prompts in language space — before they reach the image generation backbone — can reduce these failures.
 
-Three conditioning strategies are compared under a frozen T2I backbone:
+Three conditioning strategies are compared under a frozen SD 2.1 backbone:
 
-| Strategy | Symbol | Description |
-|----------|--------|-------------|
-| Raw prompting | `c_raw` | User prompt encoded directly |
-| Autoregressive rewrite | `c_ar` | Llama 3 (via Ollama) expands the prompt |
-| Diffusion refinement | `c_ref` | LLaDA-8B-Instruct iteratively denoises the prompt into a richer description |
+| Strategy | Pipeline name | Description |
+|----------|---------------|-------------|
+| Raw prompting | `raw_clip` | User prompt encoded directly via CLIP-H/14 |
+| Autoregressive rewrite | `ar_clip` | Llama 3.1 (via Ollama, temp=0) expands the prompt, then CLIP-H/14 encodes it |
+| Diffusion refinement | `llada_clip` | LLaDA-8B-Instruct iteratively unmasks the prompt into a richer description, then CLIP-H/14 encodes it |
 
-Each strategy is evaluated with both **CLIP** (77-token window) and **Long-CLIP** (248-token window) encoders, yielding a **2×3 experimental design**. The T2I backbone (Stable Diffusion 2.1) is frozen throughout — all variation is in the conditioning pathway.
+All three pipelines share the same encoder (CLIP-H/14, `laion/CLIP-ViT-H-14-laion2B-s32B-b79K`) and the same frozen T2I backbone (SD 2.1 at 768×768). All variation is in the conditioning pathway only.
 
-> **Implementation note:** The proposal refers to GENIE (Lin et al., 2023) as the diffusion language model. LLaDA-8B-Instruct (masked diffusion, iterative token unmasking) is used here as a publicly available model with the same generative mechanism. `pipeline/genie_refine.py` aliases `LLaDAPipeline` and can be swapped for a GENIE checkpoint when available.
+> **Long-CLIP status:** A Long-CLIP-L (248-token) ablation path exists in the codebase (`encoders/longclip_encoder.py`, `generation/t2i_runner.py::EmbeddingProjector`), but it is disabled in `config/experiment.yaml` pending fine-tuning of the linear EmbeddingProjector (CLIP-H 1024-dim → Long-CLIP 768-dim, seq 77→248). Re-enable by adding `longclip` to the `encoders` list in the config once the projector checkpoint is available.
+
+> **LLaDA / GENIE note:** The proposal refers to GENIE (Lin et al., 2023) as the diffusion language model. LLaDA-8B-Instruct (masked diffusion, iterative token unmasking) is used here as the closest publicly available model with the same generative mechanism. `pipeline/genie_refine.py` aliases `LLaDAPipeline` for swap compatibility.
 
 ---
 
 ## Research Questions
 
-- **RQ1** — Does diffusion-based refinement produce more semantically structured conditioning signals than raw prompts?
-- **RQ2** — Does improved conditioning reduce compositional errors (attribute misbinding, relational inconsistency)?
+- **RQ1** — Does diffusion-based refinement produce more semantically structured conditioning signals than raw prompts? (text + embedding analysis, no image generation)
+- **RQ2** — Does improved conditioning reduce compositional errors? (full generation + CLIPScore, FID, BLIP-2 VQA)
 - **RQ3** — Does prompt refinement reduce sensitivity to classifier-free guidance scale?
 - **RQ4** — Does the diffusion mechanism produce stronger improvements than autoregressive rewriting under matched expansion instructions?
 
@@ -38,53 +40,53 @@ Each strategy is evaluated with both **CLIP** (77-token window) and **Long-CLIP*
 ```
 .
 ├── config/
-│   ├── experiment.yaml          # All hyperparameters: CFG scales, seeds, model paths, eval sets
-│   └── prompts.yaml             # Benchmark prompt sets (attribute_binding, spatial_relations,
-│                                #   celebA, cats_dogs, rq3_sweep)
+│   ├── experiment.yaml          # All hyperparameters — model paths, CFG scales, seeds, eval sets
+│   └── prompts.yaml             # Benchmark prompt sets (color_binding, spatial_relations, …)
 │
 ├── pipeline/
-│   ├── base.py                  # Abstract ConditioningPipeline + EncodingResult
-│   ├── raw.py                   # RawPipeline: c_raw = f_enc(t)
-│   ├── ar_rewrite.py            # ARPipeline: c_ar = f_enc(g_AR(t))
-│   ├── llada_refine.py          # LLaDAPipeline: c_ref = f_enc(g_LLaDA(t))
-│   └── genie_refine.py          # Alias for LLaDAPipeline (swap for GENIE checkpoint)
+│   ├── base.py                  # Abstract ConditioningPipeline + EncodingResult dataclass
+│   ├── raw.py                   # raw_clip: c = f_enc(t)
+│   ├── ar_rewrite.py            # ar_clip:  c = f_enc(g_AR(t))
+│   ├── llada_refine.py          # llada_clip: c = f_enc(g_LLaDA(t))
+│   └── genie_refine.py          # Alias for LLaDAPipeline (swap when GENIE checkpoint is available)
 │
 ├── encoders/
 │   ├── base.py                  # Abstract TextEncoder interface
-│   ├── clip_encoder.py          # CLIP-H/14 (77-token, hidden_dim=1024)
-│   └── longclip_encoder.py      # Long-CLIP-L (248-token, hidden_dim=768)
+│   ├── clip_encoder.py          # CLIP-H/14 (seq=77, hidden_dim=1024) — active
+│   └── longclip_encoder.py      # Long-CLIP-L (seq=248, hidden_dim=768) — disabled (see above)
 │
 ├── rewriters/
 │   ├── base.py                  # Abstract PromptRewriter interface
-│   ├── ollama_rewriter.py       # AR baseline: Llama 3 via local Ollama server
-│   └── llada_rewriter.py        # Diffusion rewriter: LLaDA-8B-Instruct
+│   ├── ollama_rewriter.py       # AR baseline: Llama 3.1 via local Ollama, temp=0, disk cache
+│   └── llada_rewriter.py        # Diffusion rewriter: LLaDA-8B-Instruct, temp=0, disk cache
 │
 ├── generation/
-│   └── t2i_runner.py            # SD 2.1 wrapper; injects conditioning via prompt_embeds
-│                                #   Includes optional EmbeddingProjector for LongCLIP→SD 2.1
+│   └── t2i_runner.py            # SD 2.1 wrapper (768×768, v-prediction, DPMSolverMultistep)
+│                                #   Injects conditioning via prompt_embeds; optional EmbeddingProjector
 │
 ├── evaluation/
-│   ├── metrics.py               # CLIPScorer, FIDScorer, AttributeBindingScorer (BLIP-2 VQA),
-│   │                            #   RelationAccuracyScorer (BLIP-2 VQA)
-│   ├── embedding_analysis.py    # RQ1: semantic density, CLIP embedding cosine separation
-│   ├── cfg_sensitivity.py       # RQ3: CFG sweep, CFGSweepResult, compositional stability
-│   └── qualitative.py           # Rater annotation loader (CSV), Cohen's κ
+│   ├── metrics.py               # CLIPScorer, FIDScorer, AttributeBindingScorer,
+│   │                            #   RelationAccuracyScorer (latter two share one BLIP-2 instance)
+│   ├── embedding_analysis.py    # RQ1: semantic density, cosine embedding separation
+│   ├── cfg_sensitivity.py       # RQ3: CFG sweep, compositional stability
+│   └── qualitative.py           # Rater annotation loader, Cohen's κ
 │
 ├── experiments/
 │   ├── run_experiment.py        # Main CLI entry point
-│   ├── rq1_conditioning.py      # Semantic density + embedding separation analysis
-│   ├── rq2_compositional.py     # Full generation + scoring benchmark
-│   ├── rq3_cfg_sensitivity.py   # CFG sweep across all pipelines
-│   └── rq4_mechanism.py         # AR vs LLaDA head-to-head with delta metrics
+│   ├── rq1_conditioning.py      # Semantic density + embedding separation
+│   ├── rq2_compositional.py     # Generation benchmark (two-phase: generate → unload → score)
+│   ├── rq3_cfg_sensitivity.py   # CFG sweep
+│   └── rq4_mechanism.py         # AR vs LLaDA head-to-head
 │
 ├── utils/
-│   ├── seed.py                  # set_seed(), get_generator() for reproducibility
-│   ├── logging.py               # W&B integration (init, log_metrics, log_images, finish)
+│   ├── seed.py                  # set_seed(), get_generator()
+│   ├── logging.py               # W&B integration
 │   ├── prompt_io.py             # load_prompts(), expansion ratio logging
-│   └── truncation_monitor.py    # TruncationMonitor — per-pipeline truncation event tracking
+│   └── truncation_monitor.py    # Per-pipeline truncation event tracking
 │
 ├── scripts/
-│   ├── prepare_prompts.sh       # Download and format T2I-CompBench++ and auxiliary sets
+│   ├── setup_linux.sh           # Full environment setup (venv, deps, Ollama, HF login)
+│   ├── prepare_prompts.sh       # Download and format T2I-CompBench++ sets
 │   ├── submit_hpc.sh            # SLURM job templates
 │   └── run_local.sh             # Single-GPU dry run for development
 │
@@ -96,27 +98,38 @@ Each strategy is evaluated with both **CLIP** (77-token window) and **Long-CLIP*
 
 ## Setup
 
-### Requirements
+### Prerequisites
 
-- Python **3.10–3.12** (3.14 is not yet supported by `tokenizers` / `safetensors`)
-- CUDA-capable GPU — required for LLaDA (16 GB VRAM) and SD 2.1 (~5 GB VRAM)
-- [Ollama](https://ollama.com) running locally for the AR rewrite condition
+- Python **3.10–3.12** (`tokenizers` and `safetensors` do not yet support 3.14)
+- CUDA-capable GPU (recommended: ≥ 16 GB VRAM for LLaDA + SD 2.1 simultaneously)
+- [Ollama](https://ollama.com) installed locally for the AR rewrite condition
+- A [HuggingFace](https://huggingface.co/settings/tokens) account token (SD 2.1, CLIP-H, LLaDA, BLIP-2)
+
+### Automated setup (Linux / HPC)
 
 ```bash
-# 1. Create a virtual environment with Python 3.12
+bash scripts/setup_linux.sh
+```
+
+The script creates a `venv/`, installs PyTorch + all dependencies, starts Ollama, and logs you in to HuggingFace. Run it once before any experiment.
+
+### Manual setup
+
+```bash
+# 1. Virtual environment
 python3.12 -m venv venv
-source venv/bin/activate          # Windows: venv\Scripts\activate
+source venv/bin/activate
 
-# 2. Install PyTorch with CUDA (pick your version)
-#    CUDA 12.1:
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
-#    CUDA 11.8:
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
-#    CPU only (smoke tests / development):
-pip install torch torchvision
+# 2. PyTorch with CUDA (pick your version)
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121   # CUDA 12.1
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118   # CUDA 11.8
+pip install torch torchvision                                                        # CPU only
 
-# 3. Install all other dependencies
+# 3. All other dependencies
 pip install -r requirements.txt
+
+# 4. HuggingFace login (required for SD 2.1 and LLaDA weights)
+huggingface-cli login
 ```
 
 ### Ollama (AR baseline)
@@ -125,26 +138,24 @@ pip install -r requirements.txt
 ollama serve
 ```
 
-`llama3.1` is pulled automatically on first use — no manual `ollama pull` required. The AR rewriter sends prompts to `http://localhost:11434` using the same expansion instruction as LLaDA, so the generative mechanism is the only variable in RQ4.
+`llama3.1` is pulled automatically on first use — no manual `ollama pull` required. `OllamaRewriter` streams pull progress and logs it at INFO level.
 
 ### LLaDA (diffusion rewriter)
 
-LLaDA-8B-Instruct is downloaded automatically from Hugging Face on first use (~16 GB). No manual checkpoint setup required. Requires CUDA.
+`GSAI-ML/LLaDA-8B-Instruct` (~16 GB) is downloaded from HuggingFace automatically on first use. Requires CUDA. Running on CPU is technically possible but takes hours per prompt — only use CPU for debugging.
 
-### Long-CLIP encoder
+### Environment variables (`.env`)
 
-The encoder tries to download `longclip-L.pt` automatically from several candidate HuggingFace repos. If auto-download fails (the repo ID may have changed since this was written), download manually:
+Copy `.env.example` to `.env` and fill in your tokens:
 
-- HuggingFace: https://huggingface.co/BeichenZhang/LongCLIP-L
-- GitHub: https://github.com/beichenzbc/Long-CLIP
+```bash
+WANDB_API_KEY=          # https://wandb.ai/authorize
+WANDB_OFFLINE=false     # set true on HPC nodes without internet
 
-Then set the path in config:
-
-```yaml
-longclip_checkpoint: /path/to/longclip-L.pt
+HF_TOKEN=               # https://huggingface.co/settings/tokens
 ```
 
-The smoke test (`python test_pipeline.py`) skips Long-CLIP with a clear message if the checkpoint is unavailable, so you can verify everything else first.
+`setup_linux.sh` reads `HF_TOKEN` from the environment and runs `huggingface-cli login` automatically. If `HF_TOKEN` is not set it will prompt interactively.
 
 ---
 
@@ -156,77 +167,82 @@ The smoke test (`python test_pipeline.py`) skips Long-CLIP with a clear message 
 python test_pipeline.py
 ```
 
-Verifies CLIP and Long-CLIP encoding on CPU, reports Ollama and CUDA availability.
+Verifies CLIP encoding on CPU, reports Ollama and CUDA availability.
 
 ### Dry run (CPU-safe, fast)
 
 ```bash
 python experiments/run_experiment.py --rq 1 --dry-run
+python experiments/run_experiment.py --rq 2 --dry-run
 ```
 
-Runs 3 prompts through all non-LLaDA pipelines with 2 denoising steps. Used to verify the full stack before committing GPU hours.
+Runs 3 prompts through `raw_clip` and `ar_clip` (LLaDA skipped) with 2 denoising steps. BLIP-2 and FID scorers are replaced with stubs returning 0.0 to avoid OOM on memory-constrained machines. CLIPScore is still loaded and gives a real signal. Use this to verify the full stack before committing GPU hours.
 
 ### Full runs
 
 ```bash
-python experiments/run_experiment.py --rq 1   # Conditioning structure analysis (no image gen)
-python experiments/run_experiment.py --rq 2   # Compositional benchmark (CLIPScore, FID, VQA)
-python experiments/run_experiment.py --rq 3   # CFG sensitivity sweep
-python experiments/run_experiment.py --rq 4   # AR vs LLaDA mechanism comparison
-python experiments/run_experiment.py --rq all # All RQs sequentially
+python experiments/run_experiment.py --rq 1    # Conditioning structure analysis (text + embeddings, no image gen)
+python experiments/run_experiment.py --rq 2    # Compositional benchmark (CLIPScore, FID, BLIP-2 VQA)
+python experiments/run_experiment.py --rq 3    # CFG sensitivity sweep
+python experiments/run_experiment.py --rq 4    # AR vs LLaDA mechanism comparison
+python experiments/run_experiment.py --rq all  # All RQs sequentially
 ```
 
-Override config fields on the CLI:
+### CLI overrides
 
 ```bash
-python experiments/run_experiment.py --rq 2 --seed 456 --cfg 5.0
+python experiments/run_experiment.py --rq 2 --seed 456
+python experiments/run_experiment.py --rq 2 --cfg 5.0
 python experiments/run_experiment.py --rq 3 --config sampling_steps=20
-python experiments/run_experiment.py --rq 2 --no-wandb   # disable W&B
+python experiments/run_experiment.py --rq 2 --no-wandb           # disable W&B
+python experiments/run_experiment.py --rq 2 --pipeline ar_clip   # single pipeline (SLURM array use)
 ```
 
 ### HPC / SLURM
 
 ```bash
-./scripts/submit_hpc.sh
+bash scripts/submit_hpc.sh
 ```
 
-Submits separate SLURM jobs for each RQ. See the script for partition and memory settings.
+Submits separate SLURM jobs for each RQ. The `--pipeline` flag allows array jobs to run each pipeline in parallel. See the script for partition and memory settings.
 
 ---
 
 ## Configuration
 
-`config/experiment.yaml` controls all experimental parameters. Key fields:
+`config/experiment.yaml` controls all parameters. Key fields:
 
 ```yaml
 # Models
-t2i_model: stabilityai/stable-diffusion-2-1
+t2i_model: sd2-community/stable-diffusion-2-1   # 768×768 v-prediction model
 clip_model: laion/CLIP-ViT-H-14-laion2B-s32B-b79K
-longclip_checkpoint: null          # null = auto-download from HF Hub
 llada_model: GSAI-ML/LLaDA-8B-Instruct
-ollama_model: llama3
+ollama_model: llama3.1
 
 # Generation
+image_size: 768          # SD 2.1 is a v-prediction model trained at 768×768
+                         # (use 512 only for stable-diffusion-2-1-base, which is ε-prediction)
 sampling_steps: 50
-cfg_scales: [1.0, 3.0, 5.0, 7.5, 10.0]
 default_cfg_scale: 7.5
+cfg_scales: [1.0, 3.0, 5.0, 7.5, 10.0]   # RQ3 sweep
 
-# Experimental design
-encoders: [clip, longclip]
-pipelines: [raw, ar, llada]
+# Active encoder (Long-CLIP disabled pending EmbeddingProjector fine-tuning)
+encoders:
+  - clip
+  # - longclip
+
+# Rewrite cache — all RQs share the same rewrites for experimental integrity
+rewrite_cache_dir: outputs/rewrite_cache/
+
+# Seeds (five runs for variance estimation)
 seeds: [42, 123, 456, 789, 1024]
-
-# Evaluation
-vqa_model: Salesforce/blip2-flan-t5-xl
-clip_score_model: openai/clip-vit-large-patch14
-n_images_per_prompt: 5
 
 # Tracking
 wandb_project: prompt-pipeline
 output_dir: outputs/
 ```
 
-`config/prompts.yaml` contains real T2I-CompBench++ validation prompts (Huang et al.) plus two auxiliary sets:
+`config/prompts.yaml` contains real T2I-CompBench++ validation prompts (Huang et al.) plus one auxiliary set:
 
 | Set | Prompts | Source | Used in |
 |-----|---------|--------|---------|
@@ -242,33 +258,80 @@ output_dir: outputs/
 
 ## Evaluation Metrics
 
-| Metric | Implementation | Target RQ |
-|--------|---------------|-----------|
+| Metric | Implementation | RQ |
+|--------|---------------|----|
 | CLIPScore | CLIP cosine similarity (image vs prompt embedding) | RQ1, RQ2, RQ4 |
-| FID | Fréchet Inception Distance vs reference set | RQ2, RQ4 |
+| FID | Fréchet Inception Distance vs first pipeline's images as reference | RQ2, RQ4 |
 | Attribute Binding Accuracy | BLIP-2 VQA: "Is there a `<attr>` `<obj>`?" | RQ2, RQ4 |
 | Relation Accuracy | BLIP-2 VQA: "Is the `<A>` `<rel>` the `<B>`?" | RQ2, RQ4 |
-| Compositional Stability | Variance of above metrics across CFG scales | RQ3 |
-| Semantic Density | Attribute/relation token count in rewritten prompts | RQ1 |
+| Compositional Stability | Variance of metrics across CFG scales | RQ3 |
+| Semantic Density | Attribute/relation token count in rewritten vs raw prompts | RQ1 |
 | Embedding Separation | Mean pairwise cosine distance across prompt set | RQ1 |
 
-Truncation events (tokens lost when rewritten prompts exceed the encoder window) are tracked separately by `TruncationMonitor` to distinguish encoder bottleneck effects from refinement quality effects.
+`TruncationMonitor` tracks truncation events (tokens lost when rewritten prompts exceed 77 tokens) separately per pipeline, letting the analysis distinguish encoder bottleneck effects from refinement quality effects.
 
-Results are logged to Weights & Biases and saved as text summaries under `outputs/rqN/`.
+---
+
+## Output Structure
+
+```
+outputs/
+├── rewrite_cache/
+│   ├── ar_llama3.1.json         # {raw_prompt: rewrite} for Ollama/Llama
+│   └── llada.json               # {raw_prompt: rewrite} for LLaDA
+│
+├── rq1/
+│   ├── rq1_summary.txt          # Aggregate density + separation stats per pipeline
+│   ├── trace_raw_clip.jsonl     # Per-prompt: raw→rewrite, token counts, semantic density
+│   ├── trace_ar_clip.jsonl
+│   └── trace_llada_clip.jsonl
+│
+├── rq2/
+│   ├── rq2_summary.txt          # Aggregate CLIPScore, FID, VQA per pipeline × set
+│   └── {pipeline}/{set}/
+│       ├── prompt_000.png       # Generated images
+│       ├── prompt_001.png
+│       └── trace.jsonl          # Per-prompt: raw→rewrite→image_path→all scores
+│
+├── rq3/ …                       # CFG sweep results
+└── rq4/ …                       # AR vs LLaDA delta metrics + trace.jsonl
+```
+
+`trace.jsonl` files are the primary traceability artifact: each line is a JSON record linking a raw prompt to its rewrite, token counts, truncation flag, generated image path, and all per-image scores. This lets you audit any individual result end-to-end.
 
 ---
 
 ## Key Design Decisions
 
-**`prompt_embeds` injection.** The T2I runner bypasses SD 2.1's internal text encoder and passes conditioning tensors directly via diffusers' `prompt_embeds` parameter. This means the conditioning pathway is entirely under our control without modifying the backbone.
+**`prompt_embeds` injection.** `T2IRunner` bypasses SD 2.1's internal text encoder and passes conditioning tensors directly via diffusers' `prompt_embeds` parameter. The conditioning pathway is entirely under our control without touching the backbone weights.
 
-**LongCLIP → SD 2.1 dimension mismatch.** SD 2.1's UNet cross-attention expects (seq=77, dim=1024) from its CLIP-H encoder. Long-CLIP-L outputs (seq=248, dim=768). `T2IRunner` includes an optional `EmbeddingProjector` (linear dim projection + sequence interpolation) for this path. The projector starts with random weights and must be fine-tuned; for the main experiments, CLIP-H is used throughout and Long-CLIP serves as an ablation.
+**SD 2.1 is a v-prediction model.** `sd2-community/stable-diffusion-2-1` was trained with v-prediction (`prediction_type: v_prediction`) at 768×768. The community repo is missing this field in its scheduler config, so loading the pipeline naively gives epsilon-prediction — blurry, incoherent output. `T2IRunner._load()` explicitly overrides the scheduler to `DPMSolverMultistepScheduler(prediction_type="v_prediction", use_karras_sigmas=True)`. If you switch to `stabilityai/stable-diffusion-2-1-base`, use 512×512 and remove the override — that checkpoint uses epsilon-prediction.
 
-**Shared interface across conditioning paths.** All three pipelines implement `ConditioningPipeline.encode(prompt) → EncodingResult`, so `T2IRunner` and all evaluation modules are agnostic to which strategy or encoder they receive.
+**Disk-backed rewrite cache.** `OllamaRewriter` and `LLaDARewriter` each maintain a `{prompt → rewrite}` JSON cache at `outputs/rewrite_cache/`. Every RQ reads from this cache, so all RQs share the exact same rewrites — meaning the conditioning vectors analysed in RQ1 are identical to those that generated the RQ2 images. Without this, each RQ would independently call the LLM and potentially produce different expansions despite `temperature=0`. The cache also avoids redundant LLM inference across runs.
 
-**Matched expansion instructions.** `OllamaRewriter` and `LLaDARewriter` use the exact same expansion instruction string. The only variable in RQ4 is the generative mechanism (left-to-right autoregressive vs masked diffusion).
+**Two-phase RQ2.** Holding SD 2.1 (~3.5 GB), LLaDA (~16 GB), and BLIP-2 (~15 GB float32 on CPU) in memory simultaneously exceeds most machines' capacity. RQ2 therefore runs in two phases: Phase 1 generates all images and caches encoded results; Phase 2 calls `runner.unload()` (frees SD 2.1 VRAM) and then scores with BLIP-2 and CLIP. Controlled by `unload_runner_before_scoring=True` in `run_rq2()`.
 
-**No fine-tuning of the backbone.** SD 2.1 weights are frozen throughout all experiments.
+**Matched expansion instructions.** `OllamaRewriter` and `LLaDARewriter` use the exact same `_EXPANSION_INSTRUCTION` string. The only variable in RQ4 is the generative mechanism (left-to-right autoregressive vs masked diffusion iterative unmasking). Do not change one without updating the other.
+
+**Shared conditioning interface.** All three pipelines implement `ConditioningPipeline.encode(prompt) → EncodingResult`. `T2IRunner` and all scorers are agnostic to which strategy they receive, making it straightforward to add new pipelines or encoders without touching experiment code.
+
+**Frozen backbone throughout.** SD 2.1 weights are never updated. All experimental variation comes from the conditioning pathway alone.
+
+**BLIP-2 shared instance.** `AttributeBindingScorer` and `RelationAccuracyScorer` both need BLIP-2 flan-t5-xl. A module-level `_BLIP2_CACHE` in `evaluation/metrics.py` ensures the ~15 GB model is loaded only once regardless of how many scorer instances are created.
+
+---
+
+## Hardware Requirements
+
+| Component | VRAM / RAM | Notes |
+|-----------|------------|-------|
+| SD 2.1 (generation) | ~3.5 GB VRAM | float16 on CUDA; float32 on CPU (slow) |
+| CLIP-H/14 (encoder) | ~1.5 GB VRAM | float16 on CUDA, float32 on CPU |
+| LLaDA-8B (rewriter) | ~16 GB VRAM | bfloat16; CPU fallback takes hours per prompt |
+| BLIP-2 flan-t5-xl (scoring) | ~8 GB VRAM float16 / ~15 GB RAM float32 | CPU run risks OOM on 16 GB machines |
+| Ollama / Llama 3.1 (AR rewriter) | ~4 GB RAM | Managed by Ollama; CPU is usable |
+
+RQ2 with LLaDA requires a GPU with ≥ 16 GB VRAM for comfortable single-card execution. On HPC, submit `llada_clip` as a separate array task (`--pipeline llada_clip`) to a high-memory partition.
 
 ---
 

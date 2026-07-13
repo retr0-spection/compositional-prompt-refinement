@@ -111,14 +111,19 @@ def build_pipelines(cfg: dict, dry_run: bool = False) -> list:
             pipelines.append(RawPipeline(encoder=enc))
 
         if "ar" in requested:
+            cache_dir = cfg.get("rewrite_cache_dir")
+            ar_cache = str(Path(cache_dir) / f"ar_{cfg.get('ollama_model', 'llama3.1')}.json") if cache_dir else None
             ollama_cfg = OllamaRewriterConfig(
                 model=cfg.get("ollama_model", "llama3.1"),
                 base_url=cfg.get("ollama_base_url", "http://localhost:11434"),
                 timeout=cfg.get("ollama_timeout", 600),
+                cache_path=ar_cache,
             )
             pipelines.append(ARPipeline(encoder=enc, rewriter=OllamaRewriter(ollama_cfg)))
 
         if "llada" in requested and not dry_run:
+            cache_dir = cfg.get("rewrite_cache_dir")
+            llada_cache = str(Path(cache_dir) / "llada.json") if cache_dir else None
             llada_cfg_raw = cfg.get("llada", {})
             llada_cfg = LLaDARewriterConfig(
                 model_id=cfg.get("llada_model", "GSAI-ML/LLaDA-8B-Instruct"),
@@ -128,6 +133,7 @@ def build_pipelines(cfg: dict, dry_run: bool = False) -> list:
                 block_length=llada_cfg_raw.get("block_length", 32),
                 temperature=llada_cfg_raw.get("temperature", 0.0),
                 cfg_scale=llada_cfg_raw.get("cfg_scale", 0.0),
+                cache_path=llada_cache,
             )
             pipelines.append(LLaDAPipeline(encoder=enc, rewriter=LLaDARewriter(llada_cfg)))
         elif "llada" in requested and dry_run:
@@ -155,13 +161,43 @@ def build_runner(cfg: dict, dry_run: bool = False):
 
 
 def build_scorers(cfg: dict, dry_run: bool = False):
-    """Build all evaluation scorers."""
+    """
+    Build all evaluation scorers.
+
+    In dry-run mode the VQA scorers (BLIP-2, ~15 GB float32 on CPU) and FID
+    scorer (Inception-v3) are replaced with stubs that return 0.0 immediately.
+    This prevents OOM crashes when testing the pipeline locally on a Mac or
+    any machine without enough RAM to load the full scorer stack.
+    CLIPScore (~1.5 GB) is still loaded so we get a real signal on prompt–image
+    alignment even during a dry run.
+    """
     from evaluation.metrics import CLIPScorer, FIDScorer, AttributeBindingScorer, RelationAccuracyScorer
     device = "cpu" if dry_run else ("cuda" if torch.cuda.is_available() else "cpu")
-    vqa_model = cfg.get("vqa_model", "Salesforce/blip2-flan-t5-xl")
     clip_score_model = cfg.get("clip_score_model", "openai/clip-vit-large-patch14")
+    clip_scorer = CLIPScorer(model_name_or_path=clip_score_model, device=device)
+
+    if dry_run:
+        logger.info(
+            "dry-run: replacing BLIP-2 (VQA) and FID scorers with stubs to avoid OOM. "
+            "attr_binding and relation_accuracy will report 0.0."
+        )
+
+        class _StubScorer:
+            """Returns 0.0 for every call without loading any model."""
+            def mean_accuracy(self, images, prompts): return 0.0
+            def score(self, image, prompt): return {"accuracy": 0.0, "n_pairs": 0, "n_correct": 0, "details": []}
+
+        class _StubFID:
+            def update_real(self, images): pass
+            def update_generated(self, images): pass
+            def compute(self): return 0.0
+            def reset(self): pass
+
+        return clip_scorer, _StubFID(), _StubScorer(), _StubScorer()
+
+    vqa_model = cfg.get("vqa_model", "Salesforce/blip2-flan-t5-xl")
     return (
-        CLIPScorer(model_name_or_path=clip_score_model, device=device),
+        clip_scorer,
         FIDScorer(device=device, feature_dims=cfg.get("fid_dims", 2048)),
         AttributeBindingScorer(model_name_or_path=vqa_model, device=device),
         RelationAccuracyScorer(model_name_or_path=vqa_model, device=device),
@@ -174,8 +210,8 @@ def build_scorers(cfg: dict, dry_run: bool = False):
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run prompt pipeline experiments")
-    parser.add_argument("--rq", required=True, choices=["1", "2", "3", "4", "all"],
-                        help="Which research question to run")
+    parser.add_argument("--rq", required=True, choices=["0", "1", "2", "3", "4", "all"],
+                        help="Which RQ to run. 0 = warm the rewrite cache only (run before HPC jobs)")
     parser.add_argument("--seed", type=int, default=None,
                         help="Override seed (default: first seed in config)")
     parser.add_argument("--cfg", type=float, default=None,
@@ -221,6 +257,55 @@ def main() -> None:
     from utils.prompt_io import load_prompts
     output_dir = Path(cfg.get("output_dir", "outputs"))
 
+    # ------------------------------------------------------------------
+    # RQ 0 — rewrite cache warm-up (run this before HPC array jobs)
+    # Iterates over every prompt used across RQ1-4 and calls each
+    # rewriting pipeline's encode_batch() so that all rewrites are saved
+    # to disk before any RQ job starts.  Raw pipelines are skipped (no
+    # rewriter to cache).  Respects --pipeline to allow parallel warmup
+    # (e.g. SLURM array task 0 = ar_clip, task 1 = llada_clip).
+    # ------------------------------------------------------------------
+    if args.rq == "0":
+        from pipeline.raw import RawPipeline
+
+        # Union of every prompt set referenced by any RQ
+        all_set_names: set[str] = set()
+        for sets in cfg.get("eval_prompt_sets", {}).values():
+            all_set_names.update(sets)
+        seen: set[str] = set()
+        all_prompts: list[str] = []
+        for set_name in sorted(all_set_names):
+            for p in load_prompts(set_name):
+                if p not in seen:
+                    seen.add(p)
+                    all_prompts.append(p)
+
+        logger.info(
+            "Warm-cache mode: %d unique prompts across sets %s",
+            len(all_prompts), sorted(all_set_names),
+        )
+
+        pipelines = _filter_pipelines(build_pipelines(cfg, dry_run=False))
+
+        for pipeline in pipelines:
+            if isinstance(pipeline, RawPipeline):
+                logger.info("Skipping %s — no rewriter to cache.", pipeline.name)
+                continue
+            logger.info(
+                "Warming rewrite cache for %s (%d prompts)…",
+                pipeline.name, len(all_prompts),
+            )
+            pipeline.encode_batch(all_prompts)
+            logger.info("Cache warm for %s.", pipeline.name)
+
+        logger.info("Rewrite cache complete. Exiting.")
+        if wandb_log:
+            from utils.logging import finish
+            finish()
+        return
+
+    # ------------------------------------------------------------------
+
     rqs_to_run = ["1", "2", "3", "4"] if args.rq == "all" else [args.rq]
 
     def _filter_pipelines(pipelines: list) -> list:
@@ -262,6 +347,9 @@ def main() -> None:
                 s: (load_prompts(s)[:3] if dry_run else load_prompts(s))
                 for s in cfg["eval_prompt_sets"]["rq2"]
             }
+
+            print("prompt set", prompt_sets)
+            print("pipeline", pipelines)
             run_rq2(
                 pipelines=pipelines, runner=runner,
                 prompt_sets=prompt_sets,

@@ -46,6 +46,7 @@ class OllamaRewriterConfig:
     timeout: int = 600          # seconds per inference call — llama3.1 cold-start can be slow
     pull_timeout: int = 3600    # seconds for model download (llama3.1 ~4 GB)
     expansion_instruction: str = _EXPANSION_INSTRUCTION
+    cache_path: Optional[str] = None  # path to rewrite cache JSON file
 
 
 class OllamaRewriter(PromptRewriter):
@@ -68,7 +69,26 @@ class OllamaRewriter(PromptRewriter):
 
     def __init__(self, config: Optional[OllamaRewriterConfig] = None) -> None:
         self.config = config or OllamaRewriterConfig()
-        self._model_ready: bool = False  # set True after first successful pull check
+        self._model_ready: bool = False
+        self._cache: dict[str, str] = {}
+        if self.config.cache_path:
+            self._load_cache()
+
+    def _load_cache(self) -> None:
+        from pathlib import Path
+        p = Path(self.config.cache_path)
+        if p.exists():
+            with open(p) as f:
+                self._cache = json.load(f)
+            logger.info("Loaded %d cached rewrites from %s", len(self._cache), p)
+
+    def _save_cache(self) -> None:
+        from pathlib import Path
+        p = Path(self.config.cache_path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with open(p, "w") as f:
+            json.dump(self._cache, f, indent=2)
+        logger.debug("Rewrite cache saved (%d entries) → %s", len(self._cache), p)
 
     # ------------------------------------------------------------------
     # Model management
@@ -186,10 +206,16 @@ class OllamaRewriter(PromptRewriter):
         return resp.json()["message"]["content"].strip()
 
     def rewrite(self, prompt: str) -> str:
+        if prompt in self._cache:
+            logger.debug("Cache hit for prompt: %r", prompt[:60])
+            return self._cache[prompt]
         self._ensure_model()
         user_content = self.config.expansion_instruction.format(prompt=prompt)
         expanded = self._chat(user_content)
         logger.debug("Ollama expanded %r -> %r", prompt, expanded)
+        self._cache[prompt] = expanded
+        if self.config.cache_path:
+            self._save_cache()
         return expanded
 
     def rewrite_batch(self, prompts: list[str]) -> list[str]:

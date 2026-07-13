@@ -10,10 +10,13 @@ For each pipeline × encoder × seed:
   4. Compute FID against a reference set (if provided)
 
 Results are logged to W&B and saved to output_dir.
+Each pipeline×set also writes a trace.jsonl with full per-prompt traceability:
+    raw_prompt → rewritten_prompt → token counts → image path → per-prompt scores
 """
 
 from __future__ import annotations
 
+import json
 import logging
 from pathlib import Path
 from typing import Optional
@@ -37,6 +40,7 @@ def run_rq2(
     output_dir: str | Path = "outputs/rq2",
     wandb_log: bool = True,
     reference_images: Optional[list[Image.Image]] = None,
+    unload_runner_before_scoring: bool = True,
 ) -> dict[str, dict]:
     """
     Run RQ2 compositional benchmark for all pipelines.
@@ -52,33 +56,27 @@ def run_rq2(
     attr_scorer : AttributeBindingScorer
     rel_scorer : RelationAccuracyScorer
     fid_scorer : FIDScorer | None
-        If provided, FID is computed against reference_images.
     seed : int
     cfg_scale : float
     output_dir : str | Path
     wandb_log : bool
     reference_images : list[PIL.Image] | None
-        Reference images for FID. If None, FID is skipped.
+        Explicit FID reference. If None, the first pipeline's images are used.
+    unload_runner_before_scoring : bool
+        Unload SD 2.1 before loading VQA scorers to avoid OOM on small GPUs.
 
     Returns
     -------
     dict mapping pipeline_name → {set_name: metric_dict}
     """
-    from evaluation.metrics import EvalResult, score_all
+    from evaluation.metrics import EvalResult
     from utils.logging import log_metrics
-    from utils.seed import get_generator
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     all_results: dict[str, dict] = {}
 
-    # FID reference strategy:
-    # If reference_images are explicitly provided, use them for all pipelines.
-    # Otherwise, on the first pipeline pass (typically raw_clip), we collect
-    # its generated images as the FID reference distribution for all subsequent
-    # pipelines. This gives us relative FID (vs raw) rather than absolute FID
-    # (vs COCO), which is still a valid ablation signal.
     _fid_reference: Optional[list[Image.Image]] = reference_images
     _raw_pipeline_images: list[Image.Image] = []
 
@@ -86,46 +84,109 @@ def run_rq2(
         logger.info("Loading %d explicit reference images into FID scorer", len(_fid_reference))
         fid_scorer.update_real(_fid_reference)
 
+    # -----------------------------------------------------------------------
+    # Phase 1: Generate all images (runner in memory, scorers not yet loaded)
+    # Caches both images and encoding results for traceability.
+    # -----------------------------------------------------------------------
+    # generated_cache[pipeline_name][set_name] = list[PIL.Image]
+    # encoding_cache[pipeline_name][set_name]  = list[EncodingResult]
+    generated_cache: dict[str, dict[str, list[Image.Image]]] = {}
+    encoding_cache: dict[str, dict[str, list]] = {}
+
     for pipeline in pipelines:
-        logger.info("[RQ2] Pipeline: %s | CFG=%.1f | Seed=%d", pipeline.name, cfg_scale, seed)
-        pipeline_results: dict[str, dict] = {}
+        logger.info("[RQ2] Phase 1 — generating | Pipeline: %s | CFG=%.1f | Seed=%d",
+                    pipeline.name, cfg_scale, seed)
+        generated_cache[pipeline.name] = {}
+        encoding_cache[pipeline.name] = {}
 
         for set_name, prompts in prompt_sets.items():
             logger.info("[RQ2][%s] Encoding %d prompts from '%s'",
                         pipeline.name, len(prompts), set_name)
+            enc_results = pipeline.encode_batch(prompts)
+            embeddings = [r.embedding for r in enc_results]
 
-            encoding_results = pipeline.encode_batch(prompts)
-            embeddings = [r.embedding for r in encoding_results]
-            seeds = [seed] * len(prompts)
-
-            logger.info("[RQ2][%s] Generating images...", pipeline.name)
+            logger.info("[RQ2][%s] Generating images for '%s'...", pipeline.name, set_name)
             images = runner.generate_batch(
                 prompt_embeds_list=embeddings,
                 cfg_scale=cfg_scale,
-                seeds=seeds,
+                seeds=[seed] * len(prompts),
             )
 
-            # Save images
             img_dir = output_dir / pipeline.name / set_name
             img_dir.mkdir(parents=True, exist_ok=True)
-            for i, (img, prompt) in enumerate(zip(images, prompts)):
+            for i, img in enumerate(images):
                 img.save(img_dir / f"prompt_{i:03d}.png")
 
-            # Collect raw pipeline images as FID reference (first pipeline only)
+            generated_cache[pipeline.name][set_name] = images
+            encoding_cache[pipeline.name][set_name] = enc_results
+
             if fid_scorer and _fid_reference is None:
                 _raw_pipeline_images.extend(images)
 
-            # Score
-            result = score_all(
+        if fid_scorer and _fid_reference is None and _raw_pipeline_images:
+            _fid_reference = list(_raw_pipeline_images)
+            _raw_pipeline_images.clear()
+            logger.info(
+                "Using %d images from '%s' as FID reference for remaining pipelines.",
+                len(_fid_reference), pipeline.name,
+            )
+            fid_scorer.update_real(_fid_reference)
+
+    # -----------------------------------------------------------------------
+    # Phase 2: Unload runner, then score with full per-prompt tracing.
+    # -----------------------------------------------------------------------
+    if unload_runner_before_scoring:
+        logger.info("[RQ2] Unloading T2IRunner before scoring to free memory.")
+        runner.unload()
+
+    for pipeline in pipelines:
+        pipeline_results: dict[str, dict] = {}
+
+        for set_name, prompts in prompt_sets.items():
+            images = generated_cache[pipeline.name][set_name]
+            enc_results = encoding_cache[pipeline.name][set_name]
+            img_dir = output_dir / pipeline.name / set_name
+
+            # Per-prompt scoring — collects detail for trace and aggregates
+            clip_scores, attr_accs, rel_accs = [], [], []
+            trace_records = []
+
+            for i, (img, prompt, enc) in enumerate(zip(images, prompts, enc_results)):
+                clip_s = clip_scorer.score(img, prompt)
+                attr_r = attr_scorer.score(img, prompt)
+                rel_r  = rel_scorer.score(img, prompt)
+
+                clip_scores.append(clip_s)
+                attr_accs.append(attr_r["accuracy"])
+                rel_accs.append(rel_r["accuracy"])
+
+                trace_records.append({
+                    "idx": i,
+                    "pipeline": pipeline.name,
+                    "set": set_name,
+                    "raw_prompt": enc.raw_prompt,
+                    "rewritten_prompt": enc.rewritten_prompt,
+                    "token_count_raw": enc.token_count_raw,
+                    "token_count_rewritten": enc.token_count_rewritten,
+                    "was_truncated": enc.was_truncated,
+                    "image_path": str(img_dir / f"prompt_{i:03d}.png"),
+                    "clip_score": clip_s,
+                    "attr_binding": attr_r,
+                    "relation_accuracy": rel_r,
+                })
+
+            # Write per-prompt trace
+            _write_trace(trace_records, img_dir / "trace.jsonl")
+
+            n = len(prompts) or 1
+            result = EvalResult(
                 pipeline_name=pipeline.name,
-                images=images,
-                prompts=prompts,
-                clip_scorer=clip_scorer,
-                attr_scorer=attr_scorer,
-                rel_scorer=rel_scorer,
+                clip_score=sum(clip_scores) / n,
+                attr_binding_accuracy=sum(attr_accs) / n,
+                relation_accuracy=sum(rel_accs) / n,
             )
 
-            # FID — only score non-raw pipelines (comparing against raw baseline)
+            # FID
             if fid_scorer and _fid_reference is not None:
                 fid_scorer.update_generated(images)
                 result.fid = fid_scorer.compute()
@@ -154,19 +215,16 @@ def run_rq2(
 
         all_results[pipeline.name] = pipeline_results
 
-        # After the first pipeline completes, promote its images to FID reference
-        # so all subsequent pipelines are scored relative to raw output.
-        if fid_scorer and _fid_reference is None and _raw_pipeline_images:
-            _fid_reference = list(_raw_pipeline_images)
-            _raw_pipeline_images.clear()
-            logger.info(
-                "Using %d images from '%s' as FID reference for remaining pipelines.",
-                len(_fid_reference), pipeline.name,
-            )
-            fid_scorer.update_real(_fid_reference)
-
     _save_summary(all_results, output_dir / "rq2_summary.txt")
     return all_results
+
+
+def _write_trace(records: list[dict], path: Path) -> None:
+    """Write per-prompt trace records to a JSONL file (one JSON object per line)."""
+    with open(path, "w") as f:
+        for record in records:
+            f.write(json.dumps(record, default=str) + "\n")
+    logger.debug("Trace written to %s (%d records)", path, len(records))
 
 
 def _save_summary(results: dict, path: Path) -> None:

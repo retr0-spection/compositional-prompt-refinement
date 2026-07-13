@@ -15,6 +15,7 @@ No image generation required for this RQ — it operates on text and embeddings.
 
 from __future__ import annotations
 
+import json
 import logging
 from pathlib import Path
 from typing import Optional
@@ -96,6 +97,26 @@ def run_rq1(
 
         combined = {**density_stats, **separation_stats}
         results[pipeline.name] = combined
+
+        # Per-prompt trace — links raw prompt → rewritten prompt → token counts
+        from evaluation.embedding_analysis import count_semantic_tokens
+        trace_records = []
+        for enc in encoding_results:
+            trace_records.append({
+                "pipeline": pipeline.name,
+                "raw_prompt": enc.raw_prompt,
+                "rewritten_prompt": enc.rewritten_prompt,
+                "token_count_raw": enc.token_count_raw,
+                "token_count_rewritten": enc.token_count_rewritten,
+                "was_truncated": enc.was_truncated,
+                "raw_semantic_density": count_semantic_tokens(enc.raw_prompt),
+                "rw_semantic_density": count_semantic_tokens(enc.rewritten_prompt),
+            })
+        trace_path = output_dir / f"trace_{pipeline.name}.jsonl"
+        with open(trace_path, "w") as f:
+            for record in trace_records:
+                f.write(json.dumps(record, default=str) + "\n")
+        logger.debug("RQ1 trace written to %s", trace_path)
 
         if wandb_log:
             log_metrics(combined)
