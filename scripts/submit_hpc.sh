@@ -154,26 +154,28 @@ export OMP_NUM_THREADS=8
 export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128
 export PYTHONFAULTHANDLER=1
 
-# Resolve pipeline name from array index
-PIPELINE_NAMES=("raw_clip" "ar_clip" "llada_clip")
-PIPELINE_NAME="${PIPELINE_NAMES[$SLURM_ARRAY_TASK_ID]}"
-
 echo "========================================"
-echo "Job      : $SLURM_JOB_ID  (array task $SLURM_ARRAY_TASK_ID)"
+echo "Job      : $SLURM_JOB_ID"
 echo "Node     : $(hostname)"
 echo "GPUs     : $CUDA_VISIBLE_DEVICES"
 echo "RQ       : $RQ"
-echo "Pipeline : $PIPELINE_NAME"
 echo "========================================"
 nvidia-smi
 
 [[ -n "${WANDB_API_KEY:-}" ]] && \
     python -c "import wandb; wandb.login(key='${WANDB_API_KEY}', relogin=True)" 2>/dev/null || true
 
-python experiments/run_experiment.py \
-    --rq "$RQ" \
-    --pipeline "$PIPELINE_NAME" \
-    --seed "${SEED:-42}"
+# Run all pipelines sequentially in this single job
+PIPELINE_NAMES=("raw_clip" "ar_clip" "llada_clip")
+for PIPELINE_NAME in "${PIPELINE_NAMES[@]}"; do
+    echo ""
+    echo "--- Pipeline: $PIPELINE_NAME ---"
+    python experiments/run_experiment.py \
+        --rq "$RQ" \
+        --pipeline "$PIPELINE_NAME" \
+        --seed "${SEED:-42}"
+done
+echo "All pipelines complete for RQ${RQ}."
 TASK_EOF
 chmod +x "$TASK_SCRIPT"
 
@@ -275,43 +277,57 @@ WARMUP_LLADA_EOF
 chmod +x "$WARMUP_LLADA_SCRIPT"
 
 # ---------------------------------------------------------------------------
-# Step 0: Submit warmup jobs (run in parallel, no dependency)
+# Step 0: Warmup — skip if cache files already exist
 # ---------------------------------------------------------------------------
-echo ""
-echo "=== Step 0a: AR rewrite warmup (GPU node, Ollama + Llama 3.1) ==="
-WARMUP_AR_ID=$(_sbatch \
-    $(_node_args) \
-    --mem="${MEM_WARMUP_AR}" \
-    --time="${TIME_WARMUP_AR}" \
-    --job-name="prompt-warmup-ar" \
-    --output="${LOG_DIR}/warmup_ar_%j.out" \
-    --error="${LOG_DIR}/warmup_ar_%j.err" \
-    "$WARMUP_AR_SCRIPT")
-echo "  Job ID: $WARMUP_AR_ID"
+CACHE_DIR="$REPO_ROOT/outputs/rewrite_cache"
+AR_CACHE="${CACHE_DIR}/ar_llama3.1.json"
+LLADA_CACHE="${CACHE_DIR}/llada.json"
 
-echo ""
-echo "=== Step 0b: LLaDA rewrite warmup (GPU node) ==="
-WARMUP_LLADA_ID=$(_sbatch \
-    $(_node_args) \
-    --mem="${MEM_WARMUP_LLADA}" \
-    --time="${TIME_WARMUP_LLADA}" \
-    --job-name="prompt-warmup-llada" \
-    --output="${LOG_DIR}/warmup_llada_%j.out" \
-    --error="${LOG_DIR}/warmup_llada_%j.err" \
-    "$WARMUP_LLADA_SCRIPT")
-echo "  Job ID: $WARMUP_LLADA_ID"
-
-# Build SLURM dependency string (both warmup jobs must succeed)
-if $DRY_RUN; then
-    DEPENDENCY="afterok:WARMUP_AR_ID:WARMUP_LLADA_ID"
+if [[ -f "$AR_CACHE" ]] && [[ -f "$LLADA_CACHE" ]]; then
+    echo ""
+    echo "=== Rewrite cache already populated — skipping warmup jobs ==="
+    WARMUP_AR_ID="(cached)"
+    WARMUP_LLADA_ID="(cached)"
+    DEPENDENCY=""
 else
-    DEPENDENCY="afterok:${WARMUP_AR_ID}:${WARMUP_LLADA_ID}"
+    echo ""
+    echo "=== Step 0a: AR rewrite warmup ==="
+    WARMUP_AR_ID=$(_sbatch \
+        $(_node_args) \
+        --mem="${MEM_WARMUP_AR}" \
+        --time="${TIME_WARMUP_AR}" \
+        --job-name="prompt-warmup-ar" \
+        --output="${LOG_DIR}/warmup_ar_%j.out" \
+        --error="${LOG_DIR}/warmup_ar_%j.err" \
+        "$WARMUP_AR_SCRIPT")
+    echo "  Job ID: $WARMUP_AR_ID"
+
+    echo ""
+    echo "=== Step 0b: LLaDA rewrite warmup ==="
+    WARMUP_LLADA_ID=$(_sbatch \
+        $(_node_args) \
+        --mem="${MEM_WARMUP_LLADA}" \
+        --time="${TIME_WARMUP_LLADA}" \
+        --job-name="prompt-warmup-llada" \
+        --output="${LOG_DIR}/warmup_llada_%j.out" \
+        --error="${LOG_DIR}/warmup_llada_%j.err" \
+        "$WARMUP_LLADA_SCRIPT")
+    echo "  Job ID: $WARMUP_LLADA_ID"
+
+    if $DRY_RUN; then
+        DEPENDENCY="afterok:WARMUP_AR_ID:WARMUP_LLADA_ID"
+    else
+        DEPENDENCY="afterok:${WARMUP_AR_ID}:${WARMUP_LLADA_ID}"
+    fi
 fi
 
 # ---------------------------------------------------------------------------
-# Step 1-4: Submit RQ array jobs, dependent on both warmup jobs
+# Step 1-4: Submit RQ jobs sequentially chained (one job per RQ)
+# Each RQ waits for the previous one to finish before starting.
+# Pipelines run sequentially inside each job — no arrays.
 # ---------------------------------------------------------------------------
 declare -A RQ_JOB_IDS
+PREV_DEPENDENCY="$DEPENDENCY"   # first RQ depends on warmup; subsequent RQs chain off each other
 
 for RQ in "${SUBMIT_RQS[@]}"; do
     case "$RQ" in
@@ -323,22 +339,33 @@ for RQ in "${SUBMIT_RQS[@]}"; do
     esac
 
     echo ""
-    echo "=== RQ${RQ} array (${N_PIPELINES} tasks: ${PIPELINE_NAMES[*]}) ==="
+    echo "=== RQ${RQ} (pipelines: ${PIPELINE_NAMES[*]}, sequential) ==="
+
+    DEP_ARG=""
+    [[ -n "$PREV_DEPENDENCY" ]] && DEP_ARG="--dependency=${PREV_DEPENDENCY}"
 
     JOB_ID=$(_sbatch \
         $(_node_args) \
         --mem="${MEM_LIMIT}" \
         --time="${TIME_LIMIT}" \
         --job-name="prompt-rq${RQ}" \
-        --array="0-$((N_PIPELINES-1))" \
-        --dependency="${DEPENDENCY}" \
-        --output="${LOG_DIR}/rq${RQ}_%A_%a.out" \
-        --error="${LOG_DIR}/rq${RQ}_%A_%a.err" \
+        ${DEP_ARG:+"$DEP_ARG"} \
+        --output="${LOG_DIR}/rq${RQ}_%j.out" \
+        --error="${LOG_DIR}/rq${RQ}_%j.err" \
         --export=ALL,RQ="${RQ}",SEED=42,WANDB_PROJECT=prompt-pipeline,WANDB_API_KEY="${WANDB_API_KEY}",HF_TOKEN="${HF_TOKEN}" \
         "$TASK_SCRIPT")
 
     RQ_JOB_IDS[$RQ]="$JOB_ID"
-    echo "  Job ID: $JOB_ID  (depends on warmup jobs $WARMUP_AR_ID + $WARMUP_LLADA_ID)"
+    [[ -n "$PREV_DEPENDENCY" ]] \
+        && echo "  Job ID: $JOB_ID  (depends on: $PREV_DEPENDENCY)" \
+        || echo "  Job ID: $JOB_ID  (no dependency — starts immediately)"
+
+    # Next RQ chains off this one
+    if $DRY_RUN; then
+        PREV_DEPENDENCY="afterok:RQ${RQ}_JOB_ID"
+    else
+        PREV_DEPENDENCY="afterok:${JOB_ID}"
+    fi
 done
 
 # ---------------------------------------------------------------------------
@@ -349,12 +376,12 @@ echo "============================================================"
 echo "  Warmup AR    : ${WARMUP_AR_ID}"
 echo "  Warmup LLaDA : ${WARMUP_LLADA_ID}"
 for RQ in "${SUBMIT_RQS[@]}"; do
-    echo "  RQ${RQ} array    : ${RQ_JOB_IDS[$RQ]:-n/a}"
+    echo "  RQ${RQ}          : ${RQ_JOB_IDS[$RQ]:-n/a}"
 done
 echo ""
 echo "  Monitor:"
 echo "    squeue -u \$USER"
-echo "    tail -f ${LOG_DIR}/warmup_llada_*.out   # longest job"
+echo "    tail -f ${LOG_DIR}/warmup_llada_*.out"
 echo "    tail -f ${LOG_DIR}/rq2_*.out"
 echo ""
 echo "  Cancel all submitted jobs:"
