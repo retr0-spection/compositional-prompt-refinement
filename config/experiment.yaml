@@ -17,7 +17,7 @@ ollama_timeout: 600         # seconds per inference call; increase if timing out
 # ---------------------------------------------------------------------------
 # Generation
 # ---------------------------------------------------------------------------
-sampling_steps: 50
+sampling_steps: 100
 image_size: 768         # stabilityai/stable-diffusion-2-1 is a 768×768 v-pred model
                         # (use 512 only if switching to stable-diffusion-2-1-base)
 
