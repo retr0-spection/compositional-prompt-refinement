@@ -48,10 +48,15 @@ cd "$REPO_ROOT"
 # Cluster resource settings — edit for your partition and hardware
 # ---------------------------------------------------------------------------
 CONDA_ENV="prompt-pipeline" # conda env name — must match setup_linux.sh
-PARTITION_GPU="bigbatch"    # GPU partition
-GPU_TYPE=""                 # GPU constraint label (blank = any; e.g. "a100")
-CPUS_PER_TASK=8
-MEM_GPU="64G"               # Memory per GPU node
+PARTITION="biggpu"          # GPU partition (biggpu has --gres; bigbatch is CPU-only)
+
+# Memory per job — sized to actual model footprints, not --mem=0
+MEM_WARMUP_AR="8G"      # Ollama + llama3.1
+MEM_WARMUP_LLADA="20G"  # LLaDA-8B-Instruct (bfloat16, ~16 GB weights)
+MEM_RQ1="4G"            # CLIP encoding only, all rewrites are cache hits
+MEM_RQ2="16G"           # two-phase: SD 2.1 then BLIP-2, never simultaneous
+MEM_RQ3="8G"            # CFG sweep, no BLIP-2
+MEM_RQ4="16G"           # same two-phase scorer stack as RQ2
 
 TIME_WARMUP_AR="04:00:00"   # AR warmup: ~442 Ollama calls, sequential
 TIME_WARMUP_LLADA="12:00:00" # LLaDA warmup: ~442 × 128-step masked diffusion passes
@@ -107,15 +112,12 @@ _sbatch() {
     fi
 }
 
-_gpu_args() {
-    local constraint_arg=""
-    [[ -n "$GPU_TYPE" ]] && constraint_arg="--constraint=${GPU_TYPE}"
+_node_args() {
     echo \
-        "--partition=${PARTITION_GPU}" \
-        ${constraint_arg:+"$constraint_arg"} \
+        "--partition=${PARTITION}" \
+        "--nodes=1" \
         "--gres=gpu:1" \
-        "--cpus-per-task=${CPUS_PER_TASK}" \
-        "--mem=${MEM_GPU}"
+        "--cpus-per-task=16"
 }
 
 _common_env() {
@@ -146,6 +148,13 @@ conda activate "$CONDA_ENV"
 
 set -a; [[ -f "${REPO_ROOT}/.env" ]] && source "${REPO_ROOT}/.env"; set +a
 
+# ------------------------------
+# CUDA / PyTorch config
+# ------------------------------
+export OMP_NUM_THREADS=8
+export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128
+export PYTHONFAULTHANDLER=1
+
 # Resolve pipeline name from array index
 PIPELINE_NAMES=("raw_clip" "ar_clip" "llada_clip")
 PIPELINE_NAME="${PIPELINE_NAMES[$SLURM_ARRAY_TASK_ID]}"
@@ -153,10 +162,11 @@ PIPELINE_NAME="${PIPELINE_NAMES[$SLURM_ARRAY_TASK_ID]}"
 echo "========================================"
 echo "Job      : $SLURM_JOB_ID  (array task $SLURM_ARRAY_TASK_ID)"
 echo "Node     : $(hostname)"
-echo "GPU      : $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 || echo 'none')"
+echo "GPUs     : $CUDA_VISIBLE_DEVICES"
 echo "RQ       : $RQ"
 echo "Pipeline : $PIPELINE_NAME"
 echo "========================================"
+nvidia-smi
 
 [[ -n "${WANDB_API_KEY:-}" ]] && \
     python -c "import wandb; wandb.login(key='${WANDB_API_KEY}', relogin=True)" 2>/dev/null || true
@@ -185,12 +195,20 @@ conda activate "$CONDA_ENV"
 
 set -a; [[ -f "${REPO_ROOT}/.env" ]] && source "${REPO_ROOT}/.env"; set +a
 
+# ------------------------------
+# CUDA / PyTorch config
+# ------------------------------
+export OMP_NUM_THREADS=8
+export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128
+export PYTHONFAULTHANDLER=1
+
 echo "========================================"
 echo "Job      : $SLURM_JOB_ID"
 echo "Node     : $(hostname)"
-echo "GPU      : $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 || echo 'none')"
+echo "GPUs     : $CUDA_VISIBLE_DEVICES"
 echo "Phase    : AR rewrite cache warmup (ar_clip)"
 echo "========================================"
+nvidia-smi
 
 # Start Ollama in the background and wait for it to be ready.
 ollama serve &
@@ -230,12 +248,20 @@ conda activate "$CONDA_ENV"
 
 set -a; [[ -f "${REPO_ROOT}/.env" ]] && source "${REPO_ROOT}/.env"; set +a
 
+# ------------------------------
+# CUDA / PyTorch config
+# ------------------------------
+export OMP_NUM_THREADS=8
+export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128
+export PYTHONFAULTHANDLER=1
+
 echo "========================================"
 echo "Job      : $SLURM_JOB_ID"
 echo "Node     : $(hostname)"
-echo "GPU      : $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 || echo 'none')"
+echo "GPUs     : $CUDA_VISIBLE_DEVICES"
 echo "Phase    : LLaDA rewrite cache warmup (llada_clip)"
 echo "========================================"
+nvidia-smi
 
 [[ -n "${WANDB_API_KEY:-}" ]] && \
     python -c "import wandb; wandb.login(key='${WANDB_API_KEY}', relogin=True)" 2>/dev/null || true
@@ -255,7 +281,8 @@ chmod +x "$WARMUP_LLADA_SCRIPT"
 echo ""
 echo "=== Step 0a: AR rewrite warmup (GPU node, Ollama + Llama 3.1) ==="
 WARMUP_AR_ID=$(_sbatch \
-    $(_gpu_args) \
+    $(_node_args) \
+    --mem="${MEM_WARMUP_AR}" \
     --time="${TIME_WARMUP_AR}" \
     --job-name="prompt-warmup-ar" \
     --output="${LOG_DIR}/warmup_ar_%j.out" \
@@ -266,7 +293,8 @@ echo "  Job ID: $WARMUP_AR_ID"
 echo ""
 echo "=== Step 0b: LLaDA rewrite warmup (GPU node) ==="
 WARMUP_LLADA_ID=$(_sbatch \
-    $(_gpu_args) \
+    $(_node_args) \
+    --mem="${MEM_WARMUP_LLADA}" \
     --time="${TIME_WARMUP_LLADA}" \
     --job-name="prompt-warmup-llada" \
     --output="${LOG_DIR}/warmup_llada_%j.out" \
@@ -288,10 +316,10 @@ declare -A RQ_JOB_IDS
 
 for RQ in "${SUBMIT_RQS[@]}"; do
     case "$RQ" in
-        1) TIME_LIMIT=$TIME_RQ1 ;;
-        2) TIME_LIMIT=$TIME_RQ2 ;;
-        3) TIME_LIMIT=$TIME_RQ3 ;;
-        4) TIME_LIMIT=$TIME_RQ4 ;;
+        1) TIME_LIMIT=$TIME_RQ1; MEM_LIMIT=$MEM_RQ1 ;;
+        2) TIME_LIMIT=$TIME_RQ2; MEM_LIMIT=$MEM_RQ2 ;;
+        3) TIME_LIMIT=$TIME_RQ3; MEM_LIMIT=$MEM_RQ3 ;;
+        4) TIME_LIMIT=$TIME_RQ4; MEM_LIMIT=$MEM_RQ4 ;;
         *) echo "Unknown RQ: $RQ"; exit 1 ;;
     esac
 
@@ -299,7 +327,8 @@ for RQ in "${SUBMIT_RQS[@]}"; do
     echo "=== RQ${RQ} array (${N_PIPELINES} tasks: ${PIPELINE_NAMES[*]}) ==="
 
     JOB_ID=$(_sbatch \
-        $(_gpu_args) \
+        $(_node_args) \
+        --mem="${MEM_LIMIT}" \
         --time="${TIME_LIMIT}" \
         --job-name="prompt-rq${RQ}" \
         --array="0-$((N_PIPELINES-1))" \
