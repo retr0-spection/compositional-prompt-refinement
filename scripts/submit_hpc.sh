@@ -116,7 +116,6 @@ _node_args() {
     echo \
         "--partition=${PARTITION}" \
         "--nodes=1" \
-        "--gres=gpu:1" \
         "--cpus-per-task=16"
 }
 
