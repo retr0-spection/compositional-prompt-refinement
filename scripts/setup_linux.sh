@@ -2,9 +2,9 @@
 #SBATCH --job-name=prompt-setup
 #SBATCH --output=/home-mscluster/onailana/logs/setup_%j.txt
 #SBATCH --partition=bigbatch
-#SBATCH --gres=gpu:1
+#SBATCH --nodes=1
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=32G
+#SBATCH --mem=8G
 #SBATCH --time=02:00:00
 
 # =============================================================================
@@ -41,13 +41,21 @@ cd "$REPO_ROOT"
 
 source ~/.bashrc
 
+# ------------------------------
+# CUDA / PyTorch config
+# ------------------------------
+export OMP_NUM_THREADS=8
+export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128
+export PYTHONFAULTHANDLER=1
+
 echo "========================================"
 echo "Job      : $SLURM_JOB_ID"
 echo "Node     : $(hostname)"
-echo "GPU      : $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 || echo 'none')"
+echo "GPUs     : $CUDA_VISIBLE_DEVICES"
 echo "Conda    : $CONDA_ENV"
 echo "Repo     : $REPO_ROOT"
 echo "========================================"
+nvidia-smi
 
 # Load credentials from .env
 set -a; [[ -f .env ]] && source .env; set +a
