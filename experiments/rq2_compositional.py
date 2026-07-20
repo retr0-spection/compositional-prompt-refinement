@@ -71,6 +71,7 @@ def run_rq2(
     """
     from evaluation.metrics import EvalResult
     from utils.logging import log_metrics
+    from utils.naming import img_name, write_meta, check_meta
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -103,19 +104,54 @@ def run_rq2(
             logger.info("[RQ2][%s] Encoding %d prompts from '%s'",
                         pipeline.name, len(prompts), set_name)
             enc_results = pipeline.encode_batch(prompts)
-            embeddings = [r.embedding for r in enc_results]
-
-            logger.info("[RQ2][%s] Generating images for '%s'...", pipeline.name, set_name)
-            images = runner.generate_batch(
-                prompt_embeds_list=embeddings,
-                cfg_scale=cfg_scale,
-                seeds=[seed] * len(prompts),
-            )
 
             img_dir = output_dir / pipeline.name / set_name
             img_dir.mkdir(parents=True, exist_ok=True)
-            for i, img in enumerate(images):
-                img.save(img_dir / f"prompt_{i:03d}.png")
+
+            # Run-level manifest: warn loudly if cached images were produced
+            # under different settings (model, steps, resolution, ...).
+            run_settings = {
+                "cfg_scale": cfg_scale,
+                "seed": seed,
+                "model_id": getattr(runner, "model_id", "unknown"),
+                "num_inference_steps": getattr(runner, "num_inference_steps", "unknown"),
+                "resolution": getattr(runner, "resolution", "unknown"),
+            }
+            check_meta(img_dir, run_settings)
+            write_meta(img_dir, run_settings)
+
+            # ---- Disk resume: load existing images, generate only missing ----
+            img_paths = [img_dir / img_name(i, cfg_scale, seed) for i in range(len(prompts))]
+            images: list[Optional[Image.Image]] = [None] * len(prompts)
+            missing: list[int] = []
+            for i, p in enumerate(img_paths):
+                if p.exists():
+                    try:
+                        images[i] = Image.open(p).convert("RGB")
+                    except Exception:
+                        logger.warning("[RQ2][%s] Corrupt image %s — regenerating.",
+                                       pipeline.name, p)
+                        missing.append(i)
+                else:
+                    missing.append(i)
+
+            if missing:
+                logger.info(
+                    "[RQ2][%s] '%s': %d/%d images cached on disk, generating %d...",
+                    pipeline.name, set_name,
+                    len(prompts) - len(missing), len(prompts), len(missing),
+                )
+                new_images = runner.generate_batch(
+                    prompt_embeds_list=[enc_results[i].embedding for i in missing],
+                    cfg_scale=cfg_scale,
+                    seeds=[seed] * len(missing),
+                )
+                for i, img in zip(missing, new_images):
+                    img.save(img_paths[i])
+                    images[i] = img
+            else:
+                logger.info("[RQ2][%s] '%s': all %d images cached on disk — skipping generation.",
+                            pipeline.name, set_name, len(prompts))
 
             generated_cache[pipeline.name][set_name] = images
             encoding_cache[pipeline.name][set_name] = enc_results
@@ -146,37 +182,53 @@ def run_rq2(
             images = generated_cache[pipeline.name][set_name]
             enc_results = encoding_cache[pipeline.name][set_name]
             img_dir = output_dir / pipeline.name / set_name
+            trace_path = img_dir / "trace.jsonl"
 
-            # Per-prompt scoring — collects detail for trace and aggregates
-            clip_scores, attr_accs, rel_accs = [], [], []
-            trace_records = []
+            # ---- Scoring resume: skip set if a complete trace already exists ----
+            # (FID is excluded from this skip — it is cross-set and cheap relative
+            # to VQA scoring; it recomputes below only when fid_scorer is given.)
+            existing_trace = _load_trace(trace_path)
+            if existing_trace is not None and len(existing_trace) == len(prompts):
+                logger.info(
+                    "[RQ2][%s] '%s': complete trace.jsonl found (%d records) — "
+                    "reusing scores, skipping VQA/CLIP scoring.",
+                    pipeline.name, set_name, len(existing_trace),
+                )
+                clip_scores = [r["clip_score"] for r in existing_trace]
+                attr_accs = [r["attr_binding"]["accuracy"] for r in existing_trace]
+                rel_accs = [r["relation_accuracy"]["accuracy"] for r in existing_trace]
+                trace_records = existing_trace
+            else:
+                # Per-prompt scoring — collects detail for trace and aggregates
+                clip_scores, attr_accs, rel_accs = [], [], []
+                trace_records = []
 
-            for i, (img, prompt, enc) in enumerate(zip(images, prompts, enc_results)):
-                clip_s = clip_scorer.score(img, prompt)
-                attr_r = attr_scorer.score(img, prompt)
-                rel_r  = rel_scorer.score(img, prompt)
+                for i, (img, prompt, enc) in enumerate(zip(images, prompts, enc_results)):
+                    clip_s = clip_scorer.score(img, prompt)
+                    attr_r = attr_scorer.score(img, prompt)
+                    rel_r  = rel_scorer.score(img, prompt)
 
-                clip_scores.append(clip_s)
-                attr_accs.append(attr_r["accuracy"])
-                rel_accs.append(rel_r["accuracy"])
+                    clip_scores.append(clip_s)
+                    attr_accs.append(attr_r["accuracy"])
+                    rel_accs.append(rel_r["accuracy"])
 
-                trace_records.append({
-                    "idx": i,
-                    "pipeline": pipeline.name,
-                    "set": set_name,
-                    "raw_prompt": enc.raw_prompt,
-                    "rewritten_prompt": enc.rewritten_prompt,
-                    "token_count_raw": enc.token_count_raw,
-                    "token_count_rewritten": enc.token_count_rewritten,
-                    "was_truncated": enc.was_truncated,
-                    "image_path": str(img_dir / f"prompt_{i:03d}.png"),
-                    "clip_score": clip_s,
-                    "attr_binding": attr_r,
-                    "relation_accuracy": rel_r,
-                })
+                    trace_records.append({
+                        "idx": i,
+                        "pipeline": pipeline.name,
+                        "set": set_name,
+                        "raw_prompt": enc.raw_prompt,
+                        "rewritten_prompt": enc.rewritten_prompt,
+                        "token_count_raw": enc.token_count_raw,
+                        "token_count_rewritten": enc.token_count_rewritten,
+                        "was_truncated": enc.was_truncated,
+                        "image_path": str(img_dir / img_name(i, cfg_scale, seed)),
+                        "clip_score": clip_s,
+                        "attr_binding": attr_r,
+                        "relation_accuracy": rel_r,
+                    })
 
-            # Write per-prompt trace
-            _write_trace(trace_records, img_dir / "trace.jsonl")
+                # Write per-prompt trace
+                _write_trace(trace_records, trace_path)
 
             n = len(prompts) or 1
             result = EvalResult(
@@ -225,6 +277,18 @@ def _write_trace(records: list[dict], path: Path) -> None:
         for record in records:
             f.write(json.dumps(record, default=str) + "\n")
     logger.debug("Trace written to %s (%d records)", path, len(records))
+
+
+def _load_trace(path: Path) -> Optional[list[dict]]:
+    """Load an existing trace.jsonl; return None if absent or unreadable."""
+    if not path.exists():
+        return None
+    try:
+        with open(path) as f:
+            return [json.loads(line) for line in f if line.strip()]
+    except (json.JSONDecodeError, KeyError, OSError) as exc:
+        logger.warning("Could not load trace %s (%s) — will re-score.", path, exc)
+        return None
 
 
 def _save_summary(results: dict, path: Path) -> None:

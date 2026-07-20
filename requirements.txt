@@ -56,3 +56,4 @@ einops>=0.7.0                 # tensor rearrangement (used by some eval modules)
 
 # Development
 pytest>=8.0.0
+torch-fidelity
