@@ -353,59 +353,101 @@ class LLaDARewriter(PromptRewriter):
             self._save_cache()
         return expanded
 
-    def rewrite_batch(self, prompts: list[str]) -> list[str]:
+    def rewrite_batch(self, prompts: list[str], batch_size: int = 8) -> list[str]:
         """
-        Expand a batch of prompts in a single forward pass.
+        Expand a batch of prompts using chunked micro-batches.
 
-        Left-padding ensures correct attention masks across variable-length
-        inputs, matching the official batch inference pattern.
+        Why chunked: LLaDA's generate loop materialises logits of shape
+        (batch, seq_len, vocab~126k) at every denoising step — at batch 500
+        that is a single 60+ GB tensor (doubled again by the float64 Gumbel
+        step), which segfaults the process. Micro-batches of ~8 keep the
+        peak allocation in the low single-digit GBs on a 48 GB card.
+
+        Cache behaviour: hits are returned without inference; each completed
+        micro-batch is flushed to the cache file immediately, so an
+        interrupted job resumes where it left off instead of starting over.
 
         Parameters
         ----------
         prompts:
             List of raw user prompts.
+        batch_size:
+            Number of prompts per forward pass. 8 is safe for gen_length=128
+            on a 48 GB GPU; lower it if VRAM is tighter.
 
         Returns
         -------
         list[str]
             Expanded prompts in the same order as input.
         """
-        self._load()
         cfg = self.config
 
-        formatted = [
-            self._tokenizer.apply_chat_template(
-                [{"role": "user", "content": cfg.expansion_instruction.format(prompt=p)}],
-                add_generation_prompt=True,
-                tokenize=False,
+        # Resolve cache hits up front; collect misses preserving order.
+        results: dict[int, str] = {}
+        miss_indices: list[int] = []
+        for i, p in enumerate(prompts):
+            if p in self._cache:
+                results[i] = self._cache[p]
+            else:
+                miss_indices.append(i)
+
+        if miss_indices:
+            logger.info(
+                "LLaDA rewrite_batch: %d cache hits, %d to generate (batch_size=%d)",
+                len(prompts) - len(miss_indices), len(miss_indices), batch_size,
             )
-            for p in prompts
-        ]
+            self._load()
 
-        encoded = self._tokenizer(
-            formatted,
-            add_special_tokens=False,
-            padding=True,
-            return_tensors="pt",
-        )
-        input_ids = encoded["input_ids"].to(cfg.device)
-        attention_mask = encoded["attention_mask"].to(cfg.device)
+        for chunk_start in range(0, len(miss_indices), batch_size):
+            chunk_idx = miss_indices[chunk_start:chunk_start + batch_size]
+            chunk_prompts = [prompts[i] for i in chunk_idx]
 
-        out = _generate(
-            model=self._model,
-            prompt=input_ids,
-            attention_mask=attention_mask,
-            steps=cfg.steps,
-            gen_length=cfg.gen_length,
-            block_length=cfg.block_length,
-            temperature=cfg.temperature,
-            cfg_scale=cfg.cfg_scale,
-            remasking=cfg.remasking,
-        )
+            formatted = [
+                self._tokenizer.apply_chat_template(
+                    [{"role": "user", "content": cfg.expansion_instruction.format(prompt=p)}],
+                    add_generation_prompt=True,
+                    tokenize=False,
+                )
+                for p in chunk_prompts
+            ]
 
-        response_ids = out[:, input_ids.shape[1]:]
-        expanded = self._tokenizer.batch_decode(response_ids, skip_special_tokens=True)
-        return [e.strip() for e in expanded]
+            encoded = self._tokenizer(
+                formatted,
+                add_special_tokens=False,
+                padding=True,
+                return_tensors="pt",
+            )
+            input_ids = encoded["input_ids"].to(cfg.device)
+            attention_mask = encoded["attention_mask"].to(cfg.device)
+
+            out = _generate(
+                model=self._model,
+                prompt=input_ids,
+                attention_mask=attention_mask,
+                steps=cfg.steps,
+                gen_length=cfg.gen_length,
+                block_length=cfg.block_length,
+                temperature=cfg.temperature,
+                cfg_scale=cfg.cfg_scale,
+                remasking=cfg.remasking,
+            )
+
+            response_ids = out[:, input_ids.shape[1]:]
+            expanded = self._tokenizer.batch_decode(response_ids, skip_special_tokens=True)
+
+            for i, text in zip(chunk_idx, expanded):
+                text = text.strip()
+                results[i] = text
+                self._cache[prompts[i]] = text
+
+            # Checkpoint after every chunk — interrupted jobs resume from here.
+            if cfg.cache_path:
+                self._save_cache()
+
+            done = chunk_start + len(chunk_idx)
+            logger.info("LLaDA rewrite_batch: %d/%d generated.", done, len(miss_indices))
+
+        return [results[i] for i in range(len(prompts))]
 
     def unload(self) -> None:
         """Release GPU memory. Call between experiment phases if needed."""
