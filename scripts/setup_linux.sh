@@ -130,23 +130,40 @@ echo "[3/6] Installing dependencies from requirements.txt..."
 pip install --quiet -r requirements.txt
 
 # ---------------------------------------------------------------------------
-# 4. Ollama (AR baseline) — installed INTO the conda env via conda-forge.
-#    No root needed; binary lands at $CONDA_PREFIX/bin/ollama on the shared
-#    filesystem, so every compute node that activates the env can find it.
+# 4. Ollama (AR baseline) — official Linux tarball into ~/ollama-dist.
+#    conda-forge / brew packages omit the llama-server runner (known bug),
+#    so GGUF models fail with HTTP 500. The tarball ships the full layout.
+#    No root needed; ~/ollama-dist is on the shared filesystem.
 # ---------------------------------------------------------------------------
 echo ""
-echo "[4/6] Setting up Ollama (conda-forge)..."
-if ! command -v ollama &>/dev/null || [[ "$(command -v ollama)" != "$CONDA_PREFIX"* ]]; then
-    echo "  Installing ollama into env '${CONDA_ENV}'..."
-    conda install -n "$CONDA_ENV" -c conda-forge ollama -y
+echo "[4/6] Setting up Ollama (official tarball)..."
+OLLAMA_DIST="$HOME/ollama-dist"
+if [[ ! -x "$OLLAMA_DIST/bin/ollama" || ! -e "$OLLAMA_DIST/lib/ollama/llama-server" ]]; then
+    echo "  Downloading official Ollama bundle..."
+    mkdir -p "$OLLAMA_DIST"
+    # Current releases ship .tar.zst; the old .tgz URL is dead.
+    curl -fL https://ollama.com/download/ollama-linux-amd64.tar.zst -o /tmp/ollama.tar.zst
+    if tar --zstd -xf /tmp/ollama.tar.zst -C "$OLLAMA_DIST" 2>/dev/null; then
+        echo "  Extracted with tar --zstd."
+    elif command -v zstd &>/dev/null; then
+        echo "  tar lacks zstd support — using zstd pipe."
+        zstd -d -c /tmp/ollama.tar.zst | tar -x -C "$OLLAMA_DIST"
+    else
+        echo "  No zstd available — falling back to pinned .tgz release (v0.13.5)."
+        curl -fL https://github.com/ollama/ollama/releases/download/v0.13.5/ollama-linux-amd64.tgz \
+            | tar -xz -C "$OLLAMA_DIST"
+    fi
+    rm -f /tmp/ollama.tar.zst
 fi
-echo "  Ollama: $(command -v ollama) ($(ollama --version 2>/dev/null || echo 'installed'))"
+OLLAMA_BIN="$OLLAMA_DIST/bin/ollama"
+echo "  Ollama: $OLLAMA_BIN ($("$OLLAMA_BIN" --version 2>/dev/null || echo 'installed'))"
+echo "  Runner: $(ls "$OLLAMA_DIST/lib/ollama/llama-server" 2>/dev/null || echo 'MISSING — check tarball extraction')"
 
 # Model weights go to shared home — visible from all nodes.
 export OLLAMA_MODELS="${OLLAMA_MODELS:-$HOME/.ollama/models}"
 mkdir -p "$OLLAMA_MODELS"
 
-ollama serve &>/tmp/ollama_setup.log &
+"$OLLAMA_BIN" serve &>/tmp/ollama_setup.log &
 OLLAMA_PID=$!
 OLLAMA_READY=false
 for i in $(seq 1 30); do
@@ -162,7 +179,7 @@ if ! $OLLAMA_READY; then
     exit 1
 fi
 echo "  Ollama ready. Pre-pulling llama3.1..."
-ollama pull llama3.1
+"$OLLAMA_BIN" pull llama3.1
 echo "  llama3.1 ready."
 kill "$OLLAMA_PID" 2>/dev/null || true
 

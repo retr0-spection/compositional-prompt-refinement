@@ -206,17 +206,20 @@ set -a; [[ -f "${REPO_ROOT}/.env" ]] && source "${REPO_ROOT}/.env"; set +a
 
 # ------------------------------
 # Locate Ollama.
-# Primary: the conda env binary ($CONDA_PREFIX/bin/ollama), installed via
-#   conda install -c conda-forge ollama
-# conda activate above puts it on PATH, so command -v resolves it.
-# OLLAMA_BIN in .env overrides everything (e.g. module-based installs).
+# Primary: official tarball install at ~/ollama-dist (bin/ + lib/ollama/).
+# NOTE: conda-forge/homebrew ollama packages are BROKEN for GGUF models —
+# they omit the llama-server runner, which ollama looks up via hardcoded
+# paths relative to its own binary. The tarball ships the full layout:
+#   mkdir -p ~/ollama-dist
+#   curl -L https://ollama.com/download/ollama-linux-amd64.tgz | tar -xz -C ~/ollama-dist
+# OLLAMA_BIN in .env overrides everything.
 # ------------------------------
 if [[ -z "${OLLAMA_BIN:-}" ]]; then
     for candidate in \
-        "${CONDA_PREFIX:-}/bin/ollama" \
-        "$(command -v ollama 2>/dev/null || true)" \
+        "$HOME/ollama-dist/bin/ollama" \
         "$HOME/bin/ollama" \
-        "$HOME/.local/bin/ollama"; do
+        "$HOME/.local/bin/ollama" \
+        "$(command -v ollama 2>/dev/null || true)"; do
         if [[ -n "$candidate" && -x "$candidate" ]]; then
             OLLAMA_BIN="$candidate"
             break
@@ -225,8 +228,24 @@ if [[ -z "${OLLAMA_BIN:-}" ]]; then
 fi
 if [[ -z "${OLLAMA_BIN:-}" || ! -x "${OLLAMA_BIN}" ]]; then
     echo "FATAL: ollama binary not found on $(hostname)." >&2
-    echo "Install into the env:  conda activate ${CONDA_ENV} && conda install -c conda-forge ollama" >&2
-    echo "Or set OLLAMA_BIN=/path/to/ollama in .env" >&2
+    echo "Install the official tarball (includes llama-server runner):" >&2
+    echo "  mkdir -p ~/ollama-dist" >&2
+    echo "  curl -L https://ollama.com/download/ollama-linux-amd64.tgz | tar -xz -C ~/ollama-dist" >&2
+    exit 1
+fi
+
+# Verify the install is complete — catches broken conda/brew-style installs early.
+# Two valid layouts:
+#   - Ollama >= 0.2x: separate llama-server runner in lib/ollama/
+#   - Ollama 0.1x (e.g. v0.13.5): integrated runner, ggml backends in lib/ollama/
+# Broken packages ship the bare binary with NO lib/ollama contents at all.
+OLLAMA_LIB_DIR="$(dirname "$OLLAMA_BIN")/../lib/ollama"
+if [[ ! -e "$OLLAMA_LIB_DIR/llama-server" \
+   && ! -e "$(dirname "$OLLAMA_BIN")/llama-server" \
+   && -z "$(ls "$OLLAMA_LIB_DIR"/libggml-base.so* 2>/dev/null)" ]]; then
+    echo "FATAL: $OLLAMA_BIN exists but no inference runtime found (no llama-server, no ggml libs)." >&2
+    echo "This install cannot run GGUF models. Use the official bundle:" >&2
+    echo "  curl -L https://github.com/ollama/ollama/releases/download/v0.13.5/ollama-linux-amd64.tgz | tar -xz -C ~/ollama-dist" >&2
     exit 1
 fi
 echo "Using Ollama: $OLLAMA_BIN ($("$OLLAMA_BIN" --version 2>/dev/null || echo 'version unknown'))"
