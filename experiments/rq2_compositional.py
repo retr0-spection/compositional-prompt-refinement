@@ -70,7 +70,7 @@ def run_rq2(
     dict mapping pipeline_name → {set_name: metric_dict}
     """
     from evaluation.metrics import EvalResult
-    from utils.logging import log_metrics
+    from utils.logging import log_metrics, log_images
     from utils.naming import img_name, write_meta, check_meta
 
     output_dir = Path(output_dir)
@@ -155,6 +155,25 @@ def run_rq2(
 
             generated_cache[pipeline.name][set_name] = images
             encoding_cache[pipeline.name][set_name] = enc_results
+
+            # Log a small sample to W&B for qualitative comparison.
+            # Caption carries raw → rewritten so binding failures are
+            # inspectable directly in the dashboard.
+            if wandb_log:
+                n_log = min(8, len(images))
+                log_images(
+                    images[:n_log],
+                    captions=[
+                        f"[{pipeline.name}] {enc_results[i].raw_prompt}"
+                        + (
+                            f" → {enc_results[i].rewritten_prompt[:200]}"
+                            if enc_results[i].rewritten_prompt != enc_results[i].raw_prompt
+                            else ""
+                        )
+                        for i in range(n_log)
+                    ],
+                    key=f"rq2/{pipeline.name}/{set_name}",
+                )
 
             if fid_scorer and _fid_reference is None:
                 _raw_pipeline_images.extend(images)
