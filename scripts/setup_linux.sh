@@ -130,22 +130,37 @@ echo "[3/6] Installing dependencies from requirements.txt..."
 pip install --quiet -r requirements.txt
 
 # ---------------------------------------------------------------------------
-# 4. Ollama (AR baseline)
+# 4. Ollama (AR baseline) — installed INTO the conda env via conda-forge.
+#    No root needed; binary lands at $CONDA_PREFIX/bin/ollama on the shared
+#    filesystem, so every compute node that activates the env can find it.
 # ---------------------------------------------------------------------------
 echo ""
-echo "[4/6] Setting up Ollama..."
-if ! command -v ollama &>/dev/null; then
-    echo "  Installing Ollama..."
-    curl -fsSL https://ollama.com/install.sh | sh
+echo "[4/6] Setting up Ollama (conda-forge)..."
+if ! command -v ollama &>/dev/null || [[ "$(command -v ollama)" != "$CONDA_PREFIX"* ]]; then
+    echo "  Installing ollama into env '${CONDA_ENV}'..."
+    conda install -n "$CONDA_ENV" -c conda-forge ollama -y
 fi
-echo "  Ollama: $(ollama --version 2>/dev/null || echo 'installed')"
+echo "  Ollama: $(command -v ollama) ($(ollama --version 2>/dev/null || echo 'installed'))"
+
+# Model weights go to shared home — visible from all nodes.
+export OLLAMA_MODELS="${OLLAMA_MODELS:-$HOME/.ollama/models}"
+mkdir -p "$OLLAMA_MODELS"
 
 ollama serve &>/tmp/ollama_setup.log &
 OLLAMA_PID=$!
+OLLAMA_READY=false
 for i in $(seq 1 30); do
-    curl -sf http://localhost:11434/api/tags &>/dev/null && break
+    if curl -sf http://localhost:11434/api/tags &>/dev/null; then
+        OLLAMA_READY=true
+        break
+    fi
     sleep 2
 done
+if ! $OLLAMA_READY; then
+    echo "  ERROR: Ollama failed to start. Log:" >&2
+    cat /tmp/ollama_setup.log >&2
+    exit 1
+fi
 echo "  Ollama ready. Pre-pulling llama3.1..."
 ollama pull llama3.1
 echo "  llama3.1 ready."
