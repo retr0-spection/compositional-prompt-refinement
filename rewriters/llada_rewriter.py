@@ -276,6 +276,7 @@ class LLaDARewriter(PromptRewriter):
                 cfg.model_id,
                 trust_remote_code=True,
                 torch_dtype=cfg.torch_dtype,
+                low_cpu_mem_usage=True,  # stream shards — peak host RAM ≈ 1 shard, not 16 GB
             )
             .to(cfg.device)
             .eval()
