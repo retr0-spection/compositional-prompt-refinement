@@ -163,7 +163,7 @@ echo "========================================"
 echo "Job      : $SLURM_JOB_ID"
 echo "Node     : $(hostname)"
 echo "Repo     : $REPO_ROOT"
-echo "GPUs     : $CUDA_VISIBLE_DEVICES"
+echo "GPUs     : ${CUDA_VISIBLE_DEVICES:-<not set>}"
 echo "RQ       : $RQ"
 echo "========================================"
 nvidia-smi
@@ -244,7 +244,7 @@ export PYTHONFAULTHANDLER=1
 echo "========================================"
 echo "Job      : $SLURM_JOB_ID"
 echo "Node     : $(hostname)"
-echo "GPUs     : $CUDA_VISIBLE_DEVICES"
+echo "GPUs     : ${CUDA_VISIBLE_DEVICES:-<not set>}"
 echo "Phase    : AR rewrite cache warmup (ar_clip)"
 echo "========================================"
 nvidia-smi
@@ -325,7 +325,7 @@ export PYTHONFAULTHANDLER=1
 echo "========================================"
 echo "Job      : $SLURM_JOB_ID"
 echo "Node     : $(hostname)"
-echo "GPUs     : $CUDA_VISIBLE_DEVICES"
+echo "GPUs     : ${CUDA_VISIBLE_DEVICES:-<not set>}"
 echo "Phase    : LLaDA rewrite cache warmup (llada_clip)"
 echo "========================================"
 nvidia-smi
@@ -418,7 +418,7 @@ for RQ in "${SUBMIT_RQS[@]}"; do
         ${DEP_ARG:+"$DEP_ARG"} \
         --output="${LOG_DIR}/rq${RQ}_%j.out" \
         --error="${LOG_DIR}/rq${RQ}_%j.err" \
-        --export=ALL,RQ="${RQ}",SEED=42,WANDB_PROJECT=prompt-pipeline,WANDB_API_KEY="${WANDB_API_KEY}",HF_TOKEN="${HF_TOKEN}" \
+        --export=ALL,RQ="${RQ}",SEED=42,WANDB_PROJECT=prompt-pipeline \
         "$TASK_SCRIPT")
 
     RQ_JOB_IDS[$RQ]="$JOB_ID"

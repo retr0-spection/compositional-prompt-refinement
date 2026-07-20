@@ -282,16 +282,23 @@ def _run_quick_check() -> None:
 
     if _cuda_available():
         print(f"\n[CUDA] Device available: {torch.cuda.get_device_name(0)}")
-        print("\n[LLaDA] Testing rewriter (requires ~16 GB VRAM, may take a minute)...")
-        from rewriters.llada_rewriter import LLaDARewriter
-        try:
-            rw = LLaDARewriter()
-            expanded = rw.rewrite(prompt)
-            print(f"  IN:  {prompt}")
-            print(f"  OUT: {expanded}")
-            rw.unload()
-        except Exception as exc:
-            print(f"  [FAIL] LLaDA rewriter error: {exc}")
+        vram_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
+        print(f"[CUDA] VRAM: {vram_gb:.1f} GB")
+        if vram_gb < 16.0:
+            print(f"\n[LLaDA] SKIPPED — LLaDA-8B needs ~16 GB VRAM, this GPU has {vram_gb:.1f} GB.")
+            print("        This is expected on bigbatch nodes; the LLaDA warmup job")
+            print("        runs on the biggpu partition with sufficient VRAM.")
+        else:
+            print("\n[LLaDA] Testing rewriter (requires ~16 GB VRAM, may take a minute)...")
+            from rewriters.llada_rewriter import LLaDARewriter
+            try:
+                rw = LLaDARewriter()
+                expanded = rw.rewrite(prompt)
+                print(f"  IN:  {prompt}")
+                print(f"  OUT: {expanded}")
+                rw.unload()
+            except Exception as exc:
+                print(f"  [FAIL] LLaDA rewriter error: {exc}")
     else:
         print("\n[CUDA] Not available — skipping LLaDA rewriter test.")
         print("         LLaDA requires a CUDA GPU (~16 GB VRAM).")
