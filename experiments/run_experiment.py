@@ -257,6 +257,20 @@ def main() -> None:
     from utils.prompt_io import load_prompts
     output_dir = Path(cfg.get("output_dir", "outputs"))
 
+    def _filter_pipelines(pipelines: list) -> list:
+        """Keep only the requested pipeline when --pipeline is specified."""
+        if not pipeline_filter:
+            return pipelines
+        matched = [p for p in pipelines if p.name == pipeline_filter]
+        if not matched:
+            available = [p.name for p in pipelines]
+            raise ValueError(
+                f"--pipeline {pipeline_filter!r} not found. "
+                f"Available: {available}"
+            )
+        logger.info("Pipeline filter active: running only '%s'", pipeline_filter)
+        return matched
+
     # ------------------------------------------------------------------
     # RQ 0 — rewrite cache warm-up (run this before HPC array jobs)
     # Iterates over every prompt used across RQ1-4 and calls each
@@ -307,20 +321,6 @@ def main() -> None:
     # ------------------------------------------------------------------
 
     rqs_to_run = ["1", "2", "3", "4"] if args.rq == "all" else [args.rq]
-
-    def _filter_pipelines(pipelines: list) -> list:
-        """Keep only the requested pipeline when --pipeline is specified."""
-        if not pipeline_filter:
-            return pipelines
-        matched = [p for p in pipelines if p.name == pipeline_filter]
-        if not matched:
-            available = [p.name for p in pipelines]
-            raise ValueError(
-                f"--pipeline {pipeline_filter!r} not found. "
-                f"Available: {available}"
-            )
-        logger.info("Pipeline filter active: running only '%s'", pipeline_filter)
-        return matched
 
     for rq in rqs_to_run:
         logger.info("=" * 60)
