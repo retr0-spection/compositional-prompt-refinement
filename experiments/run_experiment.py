@@ -204,6 +204,52 @@ def build_scorers(cfg: dict, dry_run: bool = False):
     )
 
 
+def load_fid_reference(cfg: dict) -> list | None:
+    """
+    Load real reference images for true FID from cfg['fid_reference_dir'].
+
+    Returns None if the key is unset or the directory is missing/empty —
+    in that case RQ2 falls back to using the first pipeline's generations
+    as the reference (distribution-shift FID rather than realism FID).
+    """
+    from PIL import Image
+
+    ref_dir = cfg.get("fid_reference_dir")
+    if not ref_dir:
+        logger.warning(
+            "fid_reference_dir not set — FID will use the FIRST pipeline's images "
+            "as reference (measures distribution shift vs. baseline, NOT realism; "
+            "the first pipeline's own FID will be ~0 and should be reported as N/A)."
+        )
+        return None
+    ref_dir = Path(ref_dir)
+    if not ref_dir.is_dir():
+        logger.warning("fid_reference_dir %s does not exist — falling back to "
+                       "first-pipeline reference. Run scripts/prepare_prompts.sh "
+                       "to download the COCO reference set.", ref_dir)
+        return None
+
+    max_n = int(cfg.get("fid_reference_max_images", 500))
+    paths = sorted(
+        p for p in ref_dir.iterdir()
+        if p.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}
+    )[:max_n]
+    if not paths:
+        logger.warning("fid_reference_dir %s is empty — falling back to "
+                       "first-pipeline reference.", ref_dir)
+        return None
+
+    images = []
+    for p in paths:
+        try:
+            images.append(Image.open(p).convert("RGB"))
+        except Exception as exc:
+            logger.warning("Skipping unreadable reference image %s (%s)", p, exc)
+    logger.info("Loaded %d real reference images for true FID from %s",
+                len(images), ref_dir)
+    return images or None
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -350,6 +396,7 @@ def main() -> None:
 
             print("prompt set", prompt_sets)
             print("pipeline", pipelines)
+            fid_reference = None if dry_run else load_fid_reference(cfg)
             run_rq2(
                 pipelines=pipelines, runner=runner,
                 prompt_sets=prompt_sets,
@@ -357,6 +404,7 @@ def main() -> None:
                 fid_scorer=fid_scorer,
                 seed=seed, cfg_scale=cfg_scale,
                 output_dir=output_dir / "rq2", wandb_log=wandb_log,
+                reference_images=fid_reference,
             )
 
         elif rq == "3":

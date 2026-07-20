@@ -65,6 +65,14 @@ clip_score_model: openai/clip-vit-large-patch14   # for CLIPScore metric
 vqa_model: Salesforce/blip2-flan-t5-xl            # for attribute binding + relation accuracy
 fid_dims: 2048            # Inception feature dimensionality
 
+# True FID: directory of REAL reference images (COCO val2017 subset).
+# Populate via scripts/prepare_prompts.sh. If missing/empty, RQ2 falls back to
+# using the first pipeline's generations as reference — that measures
+# distribution shift vs. baseline, NOT realism, and the first pipeline's own
+# FID (~0) must be reported as N/A.
+fid_reference_dir: data/fid_reference
+fid_reference_max_images: 500
+
 # Number of images per prompt per condition (for FID / variance)
 n_images_per_prompt: 5
 
