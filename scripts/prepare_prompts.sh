@@ -33,6 +33,13 @@ fi
 
 mkdir -p "$FID_DIR"
 
+# Validate any pre-existing zip — a stalled earlier download leaves a
+# truncated file that unzip chokes on. -t tests the archive integrity.
+if [[ -f "$COCO_ZIP" ]] && ! unzip -tq "$COCO_ZIP" > /dev/null 2>&1; then
+    echo "Existing $COCO_ZIP is corrupt/truncated — deleting and re-downloading."
+    rm -f "$COCO_ZIP"
+fi
+
 if [[ ! -f "$COCO_ZIP" ]]; then
     echo "Downloading COCO val2017 (~1 GB)..."
     curl -fL --retry 3 --connect-timeout 30 "$COCO_URL" -o "$COCO_ZIP" || {
@@ -47,6 +54,14 @@ if [[ ! -f "$COCO_ZIP" ]]; then
         echo "     bash scripts/prepare_prompts.sh" >&2
         exit 1
     }
+fi
+
+# Final integrity gate before extraction.
+if ! unzip -tq "$COCO_ZIP" > /dev/null 2>&1; then
+    echo "FATAL: downloaded zip failed integrity check — network likely truncated it." >&2
+    echo "See the download options above (compute node / local scp)." >&2
+    rm -f "$COCO_ZIP"
+    exit 1
 fi
 
 echo "Extracting first ${N_IMAGES} images..."
