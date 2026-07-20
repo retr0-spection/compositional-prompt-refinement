@@ -222,7 +222,7 @@ ollama_model: llama3.1
 # Generation
 image_size: 768          # SD 2.1 is a v-prediction model trained at 768×768
                          # (use 512 only for stable-diffusion-2-1-base, which is ε-prediction)
-sampling_steps: 50
+sampling_steps: 100
 default_cfg_scale: 7.5
 cfg_scales: [1.0, 3.0, 5.0, 7.5, 10.0]   # RQ3 sweep
 
