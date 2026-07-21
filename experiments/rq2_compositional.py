@@ -292,9 +292,9 @@ def run_rq2(
 
 def _write_trace(records: list[dict], path: Path) -> None:
     """Write per-prompt trace records to a JSONL file (one JSON object per line)."""
-    with open(path, "w") as f:
+    with open(path, "w", encoding="utf-8") as f:
         for record in records:
-            f.write(json.dumps(record, default=str) + "\n")
+            f.write(json.dumps(record, default=str, ensure_ascii=False) + "\n")
     logger.debug("Trace written to %s (%d records)", path, len(records))
 
 
@@ -303,7 +303,7 @@ def _load_trace(path: Path) -> Optional[list[dict]]:
     if not path.exists():
         return None
     try:
-        with open(path) as f:
+        with open(path, encoding="utf-8") as f:
             return [json.loads(line) for line in f if line.strip()]
     except (json.JSONDecodeError, KeyError, OSError) as exc:
         logger.warning("Could not load trace %s (%s) — will re-score.", path, exc)
@@ -311,7 +311,7 @@ def _load_trace(path: Path) -> Optional[list[dict]]:
 
 
 def _save_summary(results: dict, path: Path) -> None:
-    with open(path, "w") as f:
+    with open(path, "w", encoding="utf-8") as f:
         f.write("RQ2 — Compositional Benchmark Results\n")
         f.write("=" * 50 + "\n\n")
         for pipeline_name, set_results in results.items():
