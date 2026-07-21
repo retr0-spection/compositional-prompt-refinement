@@ -158,6 +158,11 @@ set -a; [[ -f "${REPO_ROOT}/.env" ]] && source "${REPO_ROOT}/.env"; set +a
 export OMP_NUM_THREADS=8
 export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128
 export PYTHONFAULTHANDLER=1
+# Compute nodes run with an unset locale (ASCII default), which makes Python's
+# open()/print() crash on non-ASCII chars (em-dashes, LLaDA output). Force UTF-8.
+export LANG=C.UTF-8
+export LC_ALL=C.UTF-8
+export PYTHONIOENCODING=utf-8
 
 echo "========================================"
 echo "Job      : $SLURM_JOB_ID"
