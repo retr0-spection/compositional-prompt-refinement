@@ -22,6 +22,28 @@ from PIL import Image
 logger = logging.getLogger(__name__)
 
 
+def _nanvar(vals: list[float]) -> float:
+    """Variance over non-NaN entries; 0.0 if fewer than two remain."""
+    clean = [v for v in vals if v == v]  # v == v is False only for NaN
+    return float(np.var(clean)) if len(clean) >= 2 else 0.0
+
+
+def _coef_var(vals: list[float]) -> Optional[float]:
+    """
+    Coefficient of variation (std / |mean|) over non-NaN entries.
+
+    Returns None if fewer than two valid entries or the mean is ~0, so the
+    caller can skip a metric that carries no usable spread information.
+    """
+    clean = [v for v in vals if v == v]
+    if len(clean) < 2:
+        return None
+    mean = sum(clean) / len(clean)
+    if abs(mean) < 1e-8:
+        return None
+    return float(np.std(clean) / abs(mean))
+
+
 @dataclass
 class CFGSweepResult:
     """Results for one pipeline across all CFG scales."""
@@ -35,29 +57,39 @@ class CFGSweepResult:
 
     @property
     def clip_score_variance(self) -> float:
-        return float(np.var(self.clip_scores)) if self.clip_scores else 0.0
+        return _nanvar(self.clip_scores)
 
     @property
     def attr_accuracy_variance(self) -> float:
-        return float(np.var(self.attr_accuracies)) if self.attr_accuracies else 0.0
+        return _nanvar(self.attr_accuracies)
 
     @property
     def rel_accuracy_variance(self) -> float:
-        return float(np.var(self.rel_accuracies)) if self.rel_accuracies else 0.0
+        return _nanvar(self.rel_accuracies)
 
     @property
     def compositional_stability(self) -> float:
         """
-        Composite stability score = 1 - normalised average variance.
+        Stability across CFG scales, higher = less sensitive.
 
-        Higher is better (less sensitive to CFG scale).
-        Normalised over the expected range of each metric.
+        Defined as 1 - mean(coefficient of variation) over the available
+        metrics. Using the coefficient of variation (std / |mean|) instead of
+        raw variance makes the three metrics comparable despite living on very
+        different scales (CLIPScore ~0.18, accuracies ~0.1) — otherwise raw
+        variance lets whichever metric has the largest absolute values dominate
+        the score, which is the bug that produced near-identical ~0.9999
+        stability for every pipeline.
+
+        Metrics that are entirely NaN (no applicable prompts) are skipped.
         """
-        return 1.0 - (
-            self.clip_score_variance
-            + self.attr_accuracy_variance
-            + self.rel_accuracy_variance
-        ) / 3.0
+        cvs = [
+            _coef_var(vals)
+            for vals in (self.clip_scores, self.attr_accuracies, self.rel_accuracies)
+        ]
+        cvs = [c for c in cvs if c is not None]
+        if not cvs:
+            return float("nan")
+        return 1.0 - sum(cvs) / len(cvs)
 
     def to_dict(self) -> dict:
         """Flat dict for W&B logging."""
@@ -142,19 +174,36 @@ def sweep_cfg_scales(
             scale_dir = Path(output_dir) / pipeline.name / f"cfg{scale}"
             scale_dir.mkdir(parents=True, exist_ok=True)
             for i, (img, p) in enumerate(zip(images, prompts)):
-                img.save(scale_dir / f"prompt_{i:03d}.png")
+                img.save(scale_dir / f"prompt_{i:03d}_cfg{scale:g}_seed{seed}.png")
 
+        # CLIPScore applies to every prompt.
         clip_score = clip_scorer.mean_score(images, prompts)
-        attr_acc = attr_scorer.mean_accuracy(images, prompts)
-        rel_acc = rel_scorer.mean_accuracy(images, prompts)
+
+        # Attribute / relation accuracy must be averaged ONLY over prompts that
+        # actually contain an attribute / relation. Averaging structural zeros
+        # (a spatial prompt has no colour to bind) corrupts the mean and was
+        # the cause of the uniform 0.0000 relation accuracy in earlier runs.
+        attr_vals, rel_vals = [], []
+        for img, prompt in zip(images, prompts):
+            a = attr_scorer.score(img, prompt)
+            r = rel_scorer.score(img, prompt)
+            if a["n_pairs"] > 0:
+                attr_vals.append(a["accuracy"])
+            if r["n_relations"] > 0:
+                rel_vals.append(r["accuracy"])
+
+        attr_acc = sum(attr_vals) / len(attr_vals) if attr_vals else float("nan")
+        rel_acc = sum(rel_vals) / len(rel_vals) if rel_vals else float("nan")
 
         result.clip_scores.append(clip_score)
         result.attr_accuracies.append(attr_acc)
         result.rel_accuracies.append(rel_acc)
 
         logger.info(
-            "[%s] CFG=%.1f | CLIP=%.4f | Attr=%.4f | Rel=%.4f",
-            pipeline.name, scale, clip_score, attr_acc, rel_acc,
+            "[%s] CFG=%.1f | CLIP=%.4f | Attr=%s (n=%d) | Rel=%s (n=%d)",
+            pipeline.name, scale, clip_score,
+            f"{attr_acc:.4f}" if attr_vals else "n/a", len(attr_vals),
+            f"{rel_acc:.4f}" if rel_vals else "n/a", len(rel_vals),
         )
 
     logger.info(

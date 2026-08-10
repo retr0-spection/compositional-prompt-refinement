@@ -85,19 +85,28 @@ def run_rq3(
 
 
 def _save_summary(results, path: Path) -> None:
-    with open(path, "w") as f:
-        f.write("RQ3 — CFG Sensitivity Results\n")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("RQ3 - CFG Sensitivity Results\n")
         f.write("=" * 50 + "\n\n")
-        ranked = sorted(results, key=lambda r: r.compositional_stability, reverse=True)
+        ranked = sorted(
+            results,
+            key=lambda r: (r.compositional_stability != r.compositional_stability,
+                           -r.compositional_stability if r.compositional_stability == r.compositional_stability else 0),
+        )
+
+        def _fmt(v: float) -> str:
+            return f"{v:.4f}" if v == v else "n/a"
+
         for r in ranked:
             f.write(f"Pipeline: {r.pipeline_name}\n")
-            f.write(f"  Compositional stability: {r.compositional_stability:.4f}\n")
+            f.write(f"  Compositional stability: {_fmt(r.compositional_stability)}\n")
             f.write(f"  CLIPScore variance:      {r.clip_score_variance:.6f}\n")
             f.write(f"  Attr accuracy variance:  {r.attr_accuracy_variance:.6f}\n")
             f.write(f"  Rel accuracy variance:   {r.rel_accuracy_variance:.6f}\n")
             for scale, clip, attr, rel in zip(
                 r.cfg_scales, r.clip_scores, r.attr_accuracies, r.rel_accuracies
             ):
-                f.write(f"    CFG={scale}: CLIP={clip:.4f} Attr={attr:.4f} Rel={rel:.4f}\n")
+                f.write(f"    CFG={scale}: CLIP={_fmt(clip)} "
+                        f"Attr={_fmt(attr)} Rel={_fmt(rel)}\n")
             f.write("\n")
     logger.info("RQ3 summary saved to %s", path)

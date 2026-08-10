@@ -329,3 +329,94 @@ class T2IRunner:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         logger.info("T2IRunner unloaded.")
+
+    # ------------------------------------------------------------------
+    # Denoising-trajectory instrumentation
+    # ------------------------------------------------------------------
+
+    @torch.no_grad()
+    def generate_with_trajectory(
+        self,
+        prompt_embeds: torch.Tensor,
+        prompt_text: str,
+        clip_scorer,
+        cfg_scale: Optional[float] = None,
+        seed: Optional[int] = None,
+        num_inference_steps: Optional[int] = None,
+        score_every: int = 5,
+    ) -> tuple[Image.Image, list[dict]]:
+        """
+        Generate one image while scoring the partially-denoised latent at
+        intervals, producing a metric-vs-denoising-step trajectory.
+
+        How it works: a diffusers step-end callback fires after each denoising
+        step. Every `score_every` steps it decodes the current latent to an
+        image via the VAE, runs CLIPScore against prompt_text, and records
+        (step, clip_score). This is what makes the 'metric over timesteps'
+        plots possible.
+
+        Cost: each scored step adds one VAE decode + one CLIP forward pass, so
+        keep score_every >= 5 and run this only on a small diagnostic subset of
+        prompts, not the full benchmark.
+
+        Parameters
+        ----------
+        prompt_embeds : torch.Tensor
+            Conditioning embedding (1, seq_len, hidden_dim).
+        prompt_text : str
+            Raw prompt, used as the CLIPScore text target (score against user
+            intent, matching RQ2 convention).
+        clip_scorer : CLIPScorer
+            Loaded scorer; reused across steps.
+        score_every : int
+            Score once per this many denoising steps.
+
+        Returns
+        -------
+        (PIL.Image, list of {step, clip_score})
+        """
+        self._load()
+        cfg = self.config
+        scale = cfg_scale if cfg_scale is not None else cfg.default_cfg_scale
+        steps = num_inference_steps or cfg.num_inference_steps
+
+        embeds = self._prepare_embeds(prompt_embeds)
+        neg_embeds = self._negative_embeds().to(self._device, dtype=cfg.torch_dtype)
+
+        generator = None
+        if seed is not None:
+            from utils.seed import get_generator
+            generator = get_generator(seed, device=self._device)
+
+        trajectory: list[dict] = []
+        pipe = self._pipe
+
+        def _callback(pipe_ref, step: int, timestep: int, cbk: dict) -> dict:
+            if step % score_every != 0 and step != steps - 1:
+                return cbk
+            latents = cbk["latents"]
+            # Decode latent → image space via the VAE (same path the pipeline
+            # uses at the end), then score.
+            imgs = pipe_ref.vae.decode(
+                latents / pipe_ref.vae.config.scaling_factor, return_dict=False
+            )[0]
+            imgs = pipe_ref.image_processor.postprocess(imgs, output_type="pil")
+            try:
+                s = clip_scorer.score(imgs[0], prompt_text)
+                trajectory.append({"step": step, "clip_score": float(s)})
+            except Exception as exc:
+                logger.debug("Trajectory scoring failed at step %d (%s)", step, exc)
+            return cbk
+
+        output = pipe(
+            prompt_embeds=embeds,
+            negative_prompt_embeds=neg_embeds,
+            guidance_scale=scale,
+            num_inference_steps=steps,
+            height=cfg.image_height,
+            width=cfg.image_width,
+            generator=generator,
+            callback_on_step_end=_callback,
+            callback_on_step_end_tensor_inputs=["latents"],
+        )
+        return output.images[0], trajectory
