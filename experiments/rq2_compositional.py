@@ -250,11 +250,32 @@ def run_rq2(
                 _write_trace(trace_records, trace_path)
 
             n = len(prompts) or 1
+
+            # Average over prompts that actually HAVE something to measure.
+            # A color prompt has no spatial relation, and a spatial prompt has
+            # no color to bind — counting those structural absences as 0.0
+            # accuracy corrupts the mean (this is why color sets showed rel=0.00
+            # and spatial sets showed attr=0.00). Use per-metric denominators.
+            scored_attr = [
+                r["attr_binding"]["accuracy"]
+                for r in trace_records
+                if r["attr_binding"]["n_pairs"] > 0
+            ]
+            scored_rel = [
+                r["relation_accuracy"]["accuracy"]
+                for r in trace_records
+                if r["relation_accuracy"]["n_relations"] > 0
+            ]
+
             result = EvalResult(
                 pipeline_name=pipeline.name,
                 clip_score=sum(clip_scores) / n,
-                attr_binding_accuracy=sum(attr_accs) / n,
-                relation_accuracy=sum(rel_accs) / n,
+                attr_binding_accuracy=(
+                    sum(scored_attr) / len(scored_attr) if scored_attr else float("nan")
+                ),
+                relation_accuracy=(
+                    sum(scored_rel) / len(scored_rel) if scored_rel else float("nan")
+                ),
             )
 
             # FID
@@ -266,9 +287,15 @@ def run_rq2(
 
             metrics = {
                 f"{pipeline.name}/{set_name}/clip_score": result.clip_score,
-                f"{pipeline.name}/{set_name}/attr_binding_accuracy": result.attr_binding_accuracy,
-                f"{pipeline.name}/{set_name}/relation_accuracy": result.relation_accuracy,
             }
+            # Only report accuracy metrics that had scorable prompts — NaN means
+            # "not applicable to this set", which must not be plotted as 0.
+            if scored_attr:
+                metrics[f"{pipeline.name}/{set_name}/attr_binding_accuracy"] = result.attr_binding_accuracy
+                metrics[f"{pipeline.name}/{set_name}/attr_n_scored"] = len(scored_attr)
+            if scored_rel:
+                metrics[f"{pipeline.name}/{set_name}/relation_accuracy"] = result.relation_accuracy
+                metrics[f"{pipeline.name}/{set_name}/relation_n_scored"] = len(scored_rel)
             if result.fid is not None:
                 metrics[f"{pipeline.name}/{set_name}/fid"] = result.fid
 
@@ -278,9 +305,13 @@ def run_rq2(
                 log_metrics(metrics)
 
             logger.info(
-                "[RQ2][%s][%s] CLIP=%.4f | Attr=%.4f | Rel=%.4f | FID=%s",
+                "[RQ2][%s][%s] CLIP=%.4f | Attr=%s (n=%d) | Rel=%s (n=%d) | FID=%s",
                 pipeline.name, set_name,
-                result.clip_score, result.attr_binding_accuracy, result.relation_accuracy,
+                result.clip_score,
+                f"{result.attr_binding_accuracy:.4f}" if scored_attr else "n/a",
+                len(scored_attr),
+                f"{result.relation_accuracy:.4f}" if scored_rel else "n/a",
+                len(scored_rel),
                 f"{result.fid:.2f}" if result.fid else "N/A",
             )
 

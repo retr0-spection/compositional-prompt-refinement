@@ -39,11 +39,24 @@ _MASK_ID = 126336
 # Expansion instruction sent to LLaDA as the user turn.
 # Identical wording is used for the AR (Ollama) baseline so any difference
 # in output quality is attributable to the generative mechanism, not the prompt.
+#
+# Design (addresses the RQ1 separation-collapse finding): earlier templates
+# produced long descriptive prose that CLIP compressed into a common cluster
+# (negative separation gain). This version is object-first and length-bounded:
+# name every object and its binding up front (inside CLIP's effective ~20-token
+# window), add only concrete visual detail after, and cap the whole thing at
+# ~77 CLIP tokens so nothing important is truncated. No scene-setting,
+# no mood, no narration.
 _EXPANSION_INSTRUCTION = (
-    "Rewrite the following image generation prompt into a richly detailed description. "
-    "Explicitly name every object, assign each object its attributes (colour, size, texture, material), "
-    "describe the spatial relationships between objects, and specify the overall scene composition. "
-    "Output only the expanded prompt — no commentary, no explanation.\n\n"
+    "Expand this image prompt into a single concrete visual description.\n"
+    "Rules:\n"
+    "- Keep EVERY object from the original prompt; do not add new objects.\n"
+    "- State each object with its attributes (colour, shape, material, size) "
+    "and its spatial relation to the others FIRST, in the opening clause.\n"
+    "- Then add only concrete, visible detail about those same objects.\n"
+    "- No scene-setting, mood, lighting, camera, or narration.\n"
+    "- One sentence, under 60 words.\n"
+    "- Output only the description, no preamble.\n\n"
     "Prompt: {prompt}"
 )
 
