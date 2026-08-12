@@ -113,9 +113,9 @@ def run_rq1(
                 "rw_semantic_density": count_semantic_tokens(enc.rewritten_prompt),
             })
         trace_path = output_dir / f"trace_{pipeline.name}.jsonl"
-        with open(trace_path, "w") as f:
+        with open(trace_path, "w", encoding="utf-8") as f:
             for record in trace_records:
-                f.write(json.dumps(record, default=str) + "\n")
+                f.write(json.dumps(record, default=str, ensure_ascii=False) + "\n")
         logger.debug("RQ1 trace written to %s", trace_path)
 
         if wandb_log:
@@ -136,12 +136,47 @@ def run_rq1(
 
 
 def _save_summary(results: dict, path: Path) -> None:
-    with open(path, "w") as f:
-        f.write("RQ1 — Conditioning Structure Analysis\n")
+    """
+    Persist per-pipeline RQ1 stats to JSON sidecars, then compose a combined
+    summary across ALL pipelines that have run.
+
+    Each pipeline runs as a separate process; writing the .txt in "w" mode
+    would clobber other pipelines (the bug where only llada_clip survived).
+    The sidecars also feed evaluation.plotting's RQ1 density/separation plots.
+    """
+    path = Path(path)
+    parts_dir = path.parent / "_summary_parts"
+    parts_dir.mkdir(parents=True, exist_ok=True)
+
+    # 1. Write this process's per-pipeline sidecar(s). Strip the pipeline-name
+    #    prefix from metric keys so plotting can read bare keys like
+    #    'raw_attr_density' / 'separation_gain'.
+    for pipeline_name, stats in results.items():
+        flat = {}
+        for k, v in stats.items():
+            bare = k.split("/", 1)[1] if k.startswith(f"{pipeline_name}/") else k
+            flat[bare] = v
+        with open(parts_dir / f"{pipeline_name}.json", "w", encoding="utf-8") as f:
+            json.dump(flat, f, indent=2, default=str)
+
+    # 2. Merge every sidecar on disk.
+    merged: dict = {}
+    for part in sorted(parts_dir.glob("*.json")):
+        try:
+            merged[part.stem] = json.loads(part.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError) as exc:
+            logger.warning("Skipping unreadable RQ1 part %s (%s)", part, exc)
+
+    # 3. Rewrite the combined summary.
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("RQ1 - Conditioning Structure Analysis\n")
         f.write("=" * 50 + "\n\n")
-        for pipeline_name, stats in results.items():
+        for pipeline_name in sorted(merged):
             f.write(f"Pipeline: {pipeline_name}\n")
-            for k, v in sorted(stats.items()):
-                f.write(f"  {k}: {v:.4f}\n")
+            for k, v in sorted(merged[pipeline_name].items()):
+                try:
+                    f.write(f"  {pipeline_name}/{k}: {float(v):.4f}\n")
+                except (TypeError, ValueError):
+                    f.write(f"  {pipeline_name}/{k}: {v}\n")
             f.write("\n")
-    logger.info("RQ1 summary saved to %s", path)
+    logger.info("RQ1 summary saved to %s (%d pipelines)", path, len(merged))

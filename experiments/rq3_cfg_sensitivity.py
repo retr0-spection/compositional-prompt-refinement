@@ -10,6 +10,7 @@ and relation accuracy across scales as a proxy for compositional stability.
 
 from __future__ import annotations
 
+import json
 import logging
 from pathlib import Path
 
@@ -85,28 +86,63 @@ def run_rq3(
 
 
 def _save_summary(results, path: Path) -> None:
+    """
+    Persist per-pipeline CFG-sweep results and compose a combined summary.
+
+    Each pipeline runs as a separate process, so results go to per-pipeline
+    JSON sidecars and the .txt is rebuilt from all sidecars — avoids the
+    last-writer-clobbers-all bug where only llada_clip survived.
+    """
+    path = Path(path)
+    parts_dir = path.parent / "_summary_parts"
+    parts_dir.mkdir(parents=True, exist_ok=True)
+
+    def _fmt(v: float) -> str:
+        return f"{v:.4f}" if v == v else "n/a"
+
+    # 1. Dump this process's pipeline(s) to sidecars.
+    for r in results:
+        payload = {
+            "pipeline_name": r.pipeline_name,
+            "compositional_stability": r.compositional_stability,
+            "clip_score_variance": r.clip_score_variance,
+            "attr_accuracy_variance": r.attr_accuracy_variance,
+            "rel_accuracy_variance": r.rel_accuracy_variance,
+            "cfg_scales": list(r.cfg_scales),
+            "clip_scores": list(r.clip_scores),
+            "attr_accuracies": list(r.attr_accuracies),
+            "rel_accuracies": list(r.rel_accuracies),
+        }
+        with open(parts_dir / f"{r.pipeline_name}.json", "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, default=str)
+
+    # 2. Load every sidecar.
+    merged = []
+    for part in sorted(parts_dir.glob("*.json")):
+        try:
+            with open(part, encoding="utf-8") as f:
+                merged.append(json.load(f))
+        except (json.JSONDecodeError, OSError) as exc:
+            logger.warning("Skipping unreadable RQ3 part %s (%s)", part, exc)
+
+    # 3. Rank (nan stability last) and write combined summary.
+    merged.sort(key=lambda d: (
+        d["compositional_stability"] != d["compositional_stability"],
+        -d["compositional_stability"] if d["compositional_stability"] == d["compositional_stability"] else 0,
+    ))
     with open(path, "w", encoding="utf-8") as f:
         f.write("RQ3 - CFG Sensitivity Results\n")
         f.write("=" * 50 + "\n\n")
-        ranked = sorted(
-            results,
-            key=lambda r: (r.compositional_stability != r.compositional_stability,
-                           -r.compositional_stability if r.compositional_stability == r.compositional_stability else 0),
-        )
-
-        def _fmt(v: float) -> str:
-            return f"{v:.4f}" if v == v else "n/a"
-
-        for r in ranked:
-            f.write(f"Pipeline: {r.pipeline_name}\n")
-            f.write(f"  Compositional stability: {_fmt(r.compositional_stability)}\n")
-            f.write(f"  CLIPScore variance:      {r.clip_score_variance:.6f}\n")
-            f.write(f"  Attr accuracy variance:  {r.attr_accuracy_variance:.6f}\n")
-            f.write(f"  Rel accuracy variance:   {r.rel_accuracy_variance:.6f}\n")
+        for d in merged:
+            f.write(f"Pipeline: {d['pipeline_name']}\n")
+            f.write(f"  Compositional stability: {_fmt(d['compositional_stability'])}\n")
+            f.write(f"  CLIPScore variance:      {d['clip_score_variance']:.6f}\n")
+            f.write(f"  Attr accuracy variance:  {d['attr_accuracy_variance']:.6f}\n")
+            f.write(f"  Rel accuracy variance:   {d['rel_accuracy_variance']:.6f}\n")
             for scale, clip, attr, rel in zip(
-                r.cfg_scales, r.clip_scores, r.attr_accuracies, r.rel_accuracies
+                d["cfg_scales"], d["clip_scores"], d["attr_accuracies"], d["rel_accuracies"]
             ):
                 f.write(f"    CFG={scale}: CLIP={_fmt(clip)} "
                         f"Attr={_fmt(attr)} Rel={_fmt(rel)}\n")
             f.write("\n")
-    logger.info("RQ3 summary saved to %s", path)
+    logger.info("RQ3 summary saved to %s (%d pipelines)", path, len(merged))

@@ -97,7 +97,7 @@ def run_rq4(
             img_dir = output_dir / pipeline.name / set_name
             img_dir.mkdir(parents=True, exist_ok=True)
             for i, img in enumerate(images):
-                img.save(img_dir / f"prompt_{i:03d}.png")
+                img.save(img_dir / f"prompt_{i:03d}_cfg{cfg_scale:g}_seed{seed}.png")
 
             # Per-prompt scoring + trace
             clip_scores, attr_accs, rel_accs = [], [], []
@@ -119,7 +119,7 @@ def run_rq4(
                     "token_count_raw": enc.token_count_raw,
                     "token_count_rewritten": enc.token_count_rewritten,
                     "was_truncated": enc.was_truncated,
-                    "image_path": str(img_dir / f"prompt_{i:03d}.png"),
+                    "image_path": str(img_dir / f"prompt_{i:03d}_cfg{cfg_scale:g}_seed{seed}.png"),
                     "clip_score": clip_s,
                     "attr_binding": attr_r,
                     "relation_accuracy": rel_r,
@@ -128,10 +128,20 @@ def run_rq4(
 
             n = len(prompts) or 1
             key = f"{pipeline.name}/{set_name}"
+
+            # Structural-zero fix: average each accuracy only over prompts that
+            # actually contain an attribute / relation (see RQ2 for rationale).
+            scored_attr = [r["attr_binding"]["accuracy"] for r in trace_records
+                           if r["attr_binding"]["n_pairs"] > 0]
+            scored_rel = [r["relation_accuracy"]["accuracy"] for r in trace_records
+                          if r["relation_accuracy"]["n_relations"] > 0]
+            attr_mean = sum(scored_attr) / len(scored_attr) if scored_attr else float("nan")
+            rel_mean = sum(scored_rel) / len(scored_rel) if scored_rel else float("nan")
+
             metrics = {
                 f"{key}/clip_score": sum(clip_scores) / n,
-                f"{key}/attr_binding_accuracy": sum(attr_accs) / n,
-                f"{key}/relation_accuracy": sum(rel_accs) / n,
+                f"{key}/attr_binding_accuracy": attr_mean,
+                f"{key}/relation_accuracy": rel_mean,
                 **density_stats,
             }
             results[mechanism].setdefault(pipeline.name, {})[set_name] = metrics
@@ -140,11 +150,11 @@ def run_rq4(
                 log_metrics(metrics)
 
             logger.info(
-                "[RQ4][%s][%s] CLIP=%.4f | Attr=%.4f | Rel=%.4f",
+                "[RQ4][%s][%s] CLIP=%.4f | Attr=%s | Rel=%s",
                 pipeline.name, set_name,
                 metrics[f"{key}/clip_score"],
-                metrics[f"{key}/attr_binding_accuracy"],
-                metrics[f"{key}/relation_accuracy"],
+                f"{attr_mean:.4f}" if scored_attr else "n/a",
+                f"{rel_mean:.4f}" if scored_rel else "n/a",
             )
 
     # Head-to-head comparison: AR vs LLaDA per encoder
@@ -158,9 +168,9 @@ def run_rq4(
 
 
 def _write_trace(records: list[dict], path: Path) -> None:
-    with open(path, "w") as f:
+    with open(path, "w", encoding="utf-8") as f:
         for record in records:
-            f.write(json.dumps(record, default=str) + "\n")
+            f.write(json.dumps(record, default=str, ensure_ascii=False) + "\n")
     logger.debug("Trace written to %s (%d records)", path, len(records))
 
 

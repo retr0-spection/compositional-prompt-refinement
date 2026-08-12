@@ -57,6 +57,8 @@ _PIPELINE_ORDER = [
 
 def _style():
     """Apply a clean matplotlib style; import here to keep module import light."""
+    import matplotlib
+    matplotlib.use("Agg")  # headless compute nodes have no display
     import matplotlib.pyplot as plt
     plt.rcParams.update({
         "figure.dpi": 120,
@@ -140,6 +142,100 @@ def _applicable_mean(records: list[dict], metric: str) -> Optional[float]:
     return sum(vals) / len(vals) if vals else None
 
 
+def load_rq3_sweeps(rq3_dir: Path) -> dict[str, dict]:
+    """
+    Return {pipeline: {cfg_scales, clip_scores, attr_accuracies, rel_accuracies}}
+    from the per-pipeline sidecars written by rq3's _save_summary.
+
+    Reads outputs/rq3/_summary_parts/<pipeline>.json, so it sees ALL pipelines
+    regardless of which process wrote them.
+    """
+    parts = Path(rq3_dir) / "_summary_parts"
+    out: dict[str, dict] = {}
+    if not parts.is_dir():
+        logger.info("No RQ3 sidecars in %s — skipping CFG sweep plots.", parts)
+        return out
+    for f in sorted(parts.glob("*.json")):
+        try:
+            d = json.loads(f.read_text(encoding="utf-8"))
+            out[d["pipeline_name"]] = d
+        except Exception as exc:
+            logger.warning("Could not read RQ3 sidecar %s (%s)", f, exc)
+    return out
+
+
+def load_rq1_density(rq1_dir: Path) -> dict[str, dict]:
+    """
+    Return {pipeline: metrics} from RQ1 sidecars if present.
+
+    RQ1 currently writes a summary txt; if a _summary_parts dir exists it is
+    used, otherwise this returns empty and RQ1 plots are skipped.
+    """
+    parts = Path(rq1_dir) / "_summary_parts"
+    out: dict[str, dict] = {}
+    if not parts.is_dir():
+        logger.info("No RQ1 sidecars in %s — skipping RQ1 plots.", parts)
+        return out
+    for f in sorted(parts.glob("*.json")):
+        try:
+            out[f.stem] = json.loads(f.read_text(encoding="utf-8"))
+        except Exception as exc:
+            logger.warning("Could not read RQ1 sidecar %s (%s)", f, exc)
+    return out
+
+
+def plot_rq1_density(rq1_dir: Path, out_dir: Path) -> None:
+    """
+    RQ1 grouped bars: raw vs rewritten attribute & relation density, and a
+    separate separation-gain bar, one group per pipeline.
+    """
+    plt = _style()
+    data = load_rq1_density(rq1_dir)
+    if not data:
+        return
+    import numpy as np
+
+    pipes = [p for p in _PIPELINE_ORDER if p in data]
+    if not pipes:
+        return
+
+    # Density: raw vs rewritten attribute count.
+    fig, ax = plt.subplots(figsize=(1.4 * len(pipes) + 3, 4.5))
+    x = np.arange(len(pipes))
+    w = 0.35
+
+    def _get(p, key):
+        d = data[p]
+        # keys may be flat (llada_clip/raw_attr_density) or bare
+        for cand in (key, f"{p}/{key}"):
+            if cand in d:
+                return d[cand]
+        return None
+
+    raw_attr = [_get(p, "raw_attr_density") or 0 for p in pipes]
+    rw_attr  = [_get(p, "rw_attr_density") or 0 for p in pipes]
+    ax.bar(x - w/2, raw_attr, w, label="raw", color="#BBBBBB")
+    ax.bar(x + w/2, rw_attr,  w, label="rewritten", color="#7B5EA7")
+    ax.set_xticks(x); ax.set_xticklabels(pipes, rotation=20, ha="right")
+    ax.set_ylabel("Attribute density (count/prompt)")
+    ax.set_title("RQ1 — attribute density: raw vs rewritten")
+    ax.legend(fontsize=9)
+    _save(fig, out_dir, "rq1_attr_density")
+
+    # Separation gain (single bar per pipeline; negative = CLIP clustering).
+    sep = [_get(p, "separation_gain") for p in pipes]
+    if any(s is not None for s in sep):
+        fig, ax = plt.subplots(figsize=(1.2 * len(pipes) + 3, 4.5))
+        vals = [s if s is not None else 0 for s in sep]
+        colours = ["#C0504D" if v < 0 else "#4C9F70" for v in vals]
+        ax.bar(x, vals, color=colours)
+        ax.axhline(0, color="#333", linewidth=0.8)
+        ax.set_xticks(x); ax.set_xticklabels(pipes, rotation=20, ha="right")
+        ax.set_ylabel("Separation gain (rw − raw distance)")
+        ax.set_title("RQ1 — embedding separation gain (negative = CLIP clustering)")
+        _save(fig, out_dir, "rq1_separation_gain")
+
+
 # ---------------------------------------------------------------------------
 # Plot 1: per-set grouped bars, one metric, pipelines side by side
 # ---------------------------------------------------------------------------
@@ -202,26 +298,38 @@ def plot_cfg_sweep(
     """
     Line plot: x = CFG scale, y = metric, one line per pipeline.
 
-    rq3_results: {pipeline_name: CFGSweepResult-like} — either the live objects
-    returned by run_rq3, or dicts with cfg_scales/clip_scores/attr_accuracies/
-    rel_accuracies keys. metric in {'clip_scores','attr_accuracies','rel_accuracies'}.
+    rq3_results: {pipeline_name: obj|dict} with cfg_scales/clip_scores/
+    attr_accuracies/rel_accuracies. Accepts CFGSweepResult objects (live) or
+    plain dicts (from load_rq3_sweeps). metric in
+    {'clip_scores','attr_accuracies','rel_accuracies'}.
     """
     plt = _style()
     if not rq3_results:
         logger.warning("No RQ3 results passed — skipping CFG sweep plot.")
         return
 
+    import math
     fig, ax = plt.subplots(figsize=(6.5, 4.5))
     plotted = 0
     for pipe in _PIPELINE_ORDER:
         r = rq3_results.get(pipe)
         if r is None:
             continue
-        scales = getattr(r, "cfg_scales", None) or r.get("cfg_scales")
-        ys = getattr(r, metric, None) or r.get(metric)
+        scales = getattr(r, "cfg_scales", None)
+        if scales is None and isinstance(r, dict):
+            scales = r.get("cfg_scales")
+        ys = getattr(r, metric, None)
+        if ys is None and isinstance(r, dict):
+            ys = r.get(metric)
         if not scales or not ys:
             continue
-        ax.plot(scales, ys, marker="o", label=pipe,
+        # Drop NaN points (metrics not applicable to the sweep set).
+        pairs = [(s, y) for s, y in zip(scales, ys)
+                 if y is not None and not (isinstance(y, float) and math.isnan(y))]
+        if not pairs:
+            continue
+        xs, yv = zip(*pairs)
+        ax.plot(xs, yv, marker="o", label=pipe,
                 color=_PIPELINE_COLOURS.get(pipe, "#333"))
         plotted += 1
 
@@ -324,28 +432,39 @@ def generate_all_plots(
     """
     Render every available plot from disk artifacts.
 
-    Safe to call with partial data — absent inputs are skipped with a note.
-    Call after an RQ run, or standalone: pass rq3_results from run_rq3's return
-    value for the CFG sweeps (they aren't currently persisted to disk in a
-    plot-ready form).
+    Reads everything from disk (traces + per-pipeline sidecars), so it sees
+    ALL pipelines regardless of which process produced them. Safe to call with
+    partial data — absent inputs are skipped with a note. rq3_results is
+    optional; if not passed, CFG sweeps are loaded from the RQ3 sidecars.
     """
     root = Path(output_root)
     plot_dir = root / "plots"
+
+    # RQ1 — density + separation gain.
+    plot_rq1_density(root / "rq1", plot_dir)
 
     # RQ2 bars — CLIPScore always; accuracy metrics where applicable.
     for m in ("clip_score", "attr", "relation"):
         plot_rq2_bars(root / "rq2", plot_dir, metric=m)
 
-    # RQ3 CFG sweeps — needs the in-memory results dict.
-    if rq3_results:
+    # RQ3 CFG sweeps — prefer in-memory dict, else load from disk sidecars.
+    sweeps = rq3_results or load_rq3_sweeps(root / "rq3")
+    if sweeps:
         for m in ("clip_scores", "attr_accuracies", "rel_accuracies"):
-            plot_cfg_sweep(rq3_results, plot_dir, metric=m)
+            plot_cfg_sweep(sweeps, plot_dir, metric=m)
     else:
-        logger.info("No rq3_results passed — CFG sweep plots skipped. "
-                    "Call generate_all_plots(rq3_results=run_rq3(...)) to include them.")
+        logger.info("No RQ3 data (memory or disk) — CFG sweep plots skipped.")
 
     # Denoising trajectory — only if instrumented.
     for m in ("clip_score",):
         plot_trajectory(root / "trajectory", plot_dir, metric=m)
 
     logger.info("Plotting complete. Figures in %s", plot_dir)
+
+
+if __name__ == "__main__":
+    # Standalone: python -m evaluation.plotting [output_root]
+    import sys
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(message)s")
+    root = sys.argv[1] if len(sys.argv) > 1 else "outputs"
+    generate_all_plots(root)

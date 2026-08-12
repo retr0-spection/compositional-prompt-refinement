@@ -129,6 +129,37 @@ echo ""
 echo "[3/6] Installing dependencies from requirements.txt..."
 pip install --quiet -r requirements.txt
 
+# spaCy English model — separate download, needed by RQ1 semantic-density parsing.
+if ! python -c "import spacy; spacy.load('en_core_web_sm')" 2>/dev/null; then
+    echo "  Downloading spaCy en_core_web_sm..."
+    python -m spacy download en_core_web_sm --quiet || \
+        echo "  WARNING: spaCy model download failed — RQ1 density parsing may fall back to regex."
+fi
+
+# Verify the transformers constraint holds BOTH ways — this is the version
+# tension that previously broke the run (diffusers needs >=4.48, LLaDA needs
+# <5.0). Fail loudly here rather than deep in an RQ2 or warmup job.
+echo "  Verifying transformers compatibility..."
+python - <<'PYVERIFY'
+import sys
+import transformers
+from packaging import version
+v = version.parse(transformers.__version__)
+ok = version.parse("4.48") <= v < version.parse("5.0")
+print(f"  transformers {transformers.__version__} "
+      f"({'OK' if ok else 'OUT OF RANGE'})")
+if not ok:
+    print("  FATAL: transformers must be >=4.48,<5.0 "
+          "(diffusers needs >=4.48; LLaDA remote code breaks on 5.x).", file=sys.stderr)
+    sys.exit(1)
+try:
+    from diffusers import StableDiffusionPipeline  # noqa: F401
+    print("  diffusers import OK")
+except Exception as exc:
+    print(f"  FATAL: diffusers import failed: {exc}", file=sys.stderr)
+    sys.exit(1)
+PYVERIFY
+
 # ---------------------------------------------------------------------------
 # 4. Ollama (AR baseline) — official Linux tarball into ~/ollama-dist.
 #    conda-forge / brew packages omit the llama-server runner (known bug),

@@ -176,17 +176,38 @@ nvidia-smi
 [[ -n "${WANDB_API_KEY:-}" ]] && \
     python -c "import wandb; wandb.login(key='${WANDB_API_KEY}', relogin=True)" 2>/dev/null || true
 
-# Run all pipelines sequentially in this single job
-PIPELINE_NAMES=("raw_clip" "ar_clip" "llada_clip")
-for PIPELINE_NAME in "${PIPELINE_NAMES[@]}"; do
+# Run pipelines according to RQ needs:
+#   RQ1-3: each pipeline is independent, run them as separate processes
+#          (lets a single failure not kill the others; summaries merge via
+#           per-pipeline JSON sidecars).
+#   RQ4:   compares AR vs LLaDA HEAD-TO-HEAD, so both mechanisms must be in
+#          ONE process. Running it per-pipeline leaves one mechanism empty
+#          and the deltas uncomputable. Run it once with no --pipeline filter.
+if [[ "$RQ" == "4" ]]; then
     echo ""
-    echo "--- Pipeline: $PIPELINE_NAME ---"
+    echo "--- RQ4: all pipelines in one process (mechanism comparison) ---"
     python experiments/run_experiment.py \
-        --rq "$RQ" \
-        --pipeline "$PIPELINE_NAME" \
+        --rq 4 \
         --seed "${SEED:-42}"
-done
+else
+    PIPELINE_NAMES=("raw_clip" "ar_clip" "llada_clip")
+    for PIPELINE_NAME in "${PIPELINE_NAMES[@]}"; do
+        echo ""
+        echo "--- Pipeline: $PIPELINE_NAME ---"
+        python experiments/run_experiment.py \
+            --rq "$RQ" \
+            --pipeline "$PIPELINE_NAME" \
+            --seed "${SEED:-42}"
+    done
+fi
 echo "All pipelines complete for RQ${RQ}."
+
+# Regenerate all plots from disk artifacts (traces + per-pipeline sidecars).
+# Idempotent and cheap — reads whatever exists so far, so running it after
+# every RQ progressively fills in figures. Never fails the job on plot errors.
+echo ""
+echo "--- Regenerating plots ---"
+python -m evaluation.plotting outputs || echo "WARN: plotting step failed (non-fatal)."
 TASK_EOF
 chmod +x "$TASK_SCRIPT"
 
