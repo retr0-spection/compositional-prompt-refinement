@@ -212,15 +212,15 @@ def plot_rq1_density(rq1_dir: Path, out_dir: Path) -> None:
                 return d[cand]
         return None
 
-    raw_attr = [_get(p, "raw_attr_density") or 0 for p in pipes]
-    rw_attr  = [_get(p, "rw_attr_density") or 0 for p in pipes]
+    raw_attr = [_get(p, "raw_attr_count") or 0 for p in pipes]
+    rw_attr  = [_get(p, "rw_attr_count") or 0 for p in pipes]
     ax.bar(x - w/2, raw_attr, w, label="raw", color="#BBBBBB")
     ax.bar(x + w/2, rw_attr,  w, label="rewritten", color="#7B5EA7")
     ax.set_xticks(x); ax.set_xticklabels(pipes, rotation=20, ha="right")
-    ax.set_ylabel("Attribute density (count/prompt)")
-    ax.set_title("RQ1 — attribute density: raw vs rewritten")
+    ax.set_ylabel("Attribute count (per prompt)")
+    ax.set_title("RQ1 — attribute count: raw vs rewritten")
     ax.legend(fontsize=9)
-    _save(fig, out_dir, "rq1_attr_density")
+    _save(fig, out_dir, "rq1_attr_count")
 
     # Separation gain (single bar per pipeline; negative = CLIP clustering).
     sep = [_get(p, "separation_gain") for p in pipes]

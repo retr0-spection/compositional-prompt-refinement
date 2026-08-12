@@ -13,7 +13,9 @@ Two analyses:
 
 from __future__ import annotations
 
+import json
 import logging
+import re
 from typing import Optional
 
 import torch
@@ -21,7 +23,7 @@ import torch.nn.functional as F
 
 logger = logging.getLogger(__name__)
 
-# Simple entity/relation keyword lists (extend or replace with spaCy NER)
+# Fallback keyword lists — used only when the LLM extractor is unavailable.
 _ATTRIBUTE_TOKENS = [
     "red", "blue", "green", "yellow", "orange", "purple", "pink",
     "white", "black", "grey", "gray", "brown", "gold", "silver",
@@ -36,52 +38,183 @@ _RELATION_TOKENS = [
     "against", "around", "through", "across", "along",
 ]
 
+# ---------------------------------------------------------------------------
+# LLM-based semantic extraction (Ollama)
+# ---------------------------------------------------------------------------
 
-def count_semantic_tokens(text: str) -> dict[str, int]:
+_EXTRACT_PROMPT = (
+    "Count the visual attributes and spatial relations in this image caption.\n"
+    "- Attributes = words describing an object's colour, size, shape, material, "
+    "or texture (e.g. red, tiny, wooden, striped).\n"
+    "- Relations = words/phrases describing spatial arrangement between objects "
+    "(e.g. left of, above, beside, on top of, behind).\n"
+    "Count every occurrence, including synonyms and multi-word phrases.\n"
+    'Respond ONLY with JSON: {{"attributes": <int>, "relations": <int>}}\n\n'
+    "Caption: {text}"
+)
+
+_JSON_RE = re.compile(r'\{[^{}]*"attributes"[^{}]*\}', re.DOTALL)
+
+
+class SemanticCounter:
+    """
+    Counts attributes and relations in text, preferring an Ollama LLM and
+    falling back to keyword matching when the LLM is unavailable.
+
+    The LLM catches attributes/relations the fixed keyword lists miss
+    (crimson, enormous, velvet, 'perched atop', ...), giving a truer count
+    of how much compositional content a rewrite actually added.
+
+    Results are cached per (text) so repeated prompts across RQ1 pipelines
+    don't re-query the LLM.
+    """
+
+    def __init__(
+        self,
+        use_llm: bool = True,
+        model: str = "llama3.1",
+        base_url: str = "http://localhost:11434",
+        timeout: int = 60,
+    ) -> None:
+        self.use_llm = use_llm
+        self.model = model
+        self.base_url = base_url.rstrip("/")
+        self.timeout = timeout
+        self._cache: dict[str, dict[str, int]] = {}
+        self._llm_ok: Optional[bool] = None  # None = untested
+
+    # -- keyword fallback ------------------------------------------------
+
+    @staticmethod
+    def _keyword_count(text: str) -> dict[str, int]:
+        words = text.lower().split()
+        return {
+            "attributes": sum(1 for w in words if w in _ATTRIBUTE_TOKENS),
+            "relations": sum(1 for w in words if w in _RELATION_TOKENS),
+        }
+
+    # -- LLM path --------------------------------------------------------
+
+    def _llm_count(self, text: str) -> Optional[dict[str, int]]:
+        """Query Ollama; return None on any failure so caller can fall back."""
+        import requests
+        try:
+            resp = requests.post(
+                f"{self.base_url}/api/generate",
+                json={
+                    "model": self.model,
+                    "prompt": _EXTRACT_PROMPT.format(text=text),
+                    "stream": False,
+                    "options": {"temperature": 0.0},
+                    "format": "json",
+                },
+                timeout=self.timeout,
+            )
+            resp.raise_for_status()
+            body = resp.json().get("response", "")
+            # With format=json Ollama returns clean JSON, but guard anyway.
+            match = _JSON_RE.search(body) or re.search(r"\{.*\}", body, re.DOTALL)
+            data = json.loads(match.group(0) if match else body)
+            return {
+                "attributes": int(data.get("attributes", 0)),
+                "relations": int(data.get("relations", 0)),
+            }
+        except Exception as exc:
+            logger.debug("LLM count failed for %r (%s)", text[:50], exc)
+            return None
+
+    # -- public ----------------------------------------------------------
+
+    def count(self, text: str) -> dict[str, int]:
+        """
+        Return {attributes, relations, total_words} for a single text.
+
+        Tries the LLM once; if the first call fails, disables the LLM for the
+        rest of this run and uses keyword counting throughout (avoids 500
+        timeouts per prompt when Ollama isn't up).
+        """
+        if text in self._cache:
+            counts = self._cache[text]
+        else:
+            counts = None
+            if self.use_llm and self._llm_ok is not False:
+                counts = self._llm_count(text)
+                if counts is None and self._llm_ok is None:
+                    logger.warning(
+                        "Ollama unavailable for semantic counting — "
+                        "falling back to keyword lists for this run."
+                    )
+                    self._llm_ok = False
+                elif counts is not None:
+                    self._llm_ok = True
+            if counts is None:
+                counts = self._keyword_count(text)
+            self._cache[text] = counts
+
+        return {
+            "n_attribute_tokens": counts["attributes"],
+            "n_relation_tokens": counts["relations"],
+            "total_words": len(text.split()),
+            "semantic_density": (
+                (counts["attributes"] + counts["relations"]) / len(text.split())
+                if text.split() else 0.0
+            ),
+        }
+
+
+# Module-level default counter (LLM on). Override in analyse_semantic_density
+# for tests or when Ollama is known to be down.
+_DEFAULT_COUNTER = SemanticCounter(use_llm=True)
+
+
+def count_semantic_tokens(text: str, counter: Optional[SemanticCounter] = None) -> dict:
     """
     Count attribute and relation tokens in a text string.
 
-    Returns
-    -------
-    dict with keys: n_attribute_tokens, n_relation_tokens, total_words
+    Uses the LLM-backed SemanticCounter by default (keyword fallback if the
+    LLM is unavailable). Pass a custom counter to force keyword-only:
+        count_semantic_tokens(text, SemanticCounter(use_llm=False))
+
+    Returns keys: n_attribute_tokens, n_relation_tokens, total_words,
+    semantic_density.
     """
-    words = text.lower().split()
-    n_attr = sum(1 for w in words if w in _ATTRIBUTE_TOKENS)
-    n_rel = sum(1 for w in words if w in _RELATION_TOKENS)
-    return {
-        "n_attribute_tokens": n_attr,
-        "n_relation_tokens": n_rel,
-        "total_words": len(words),
-        "semantic_density": (n_attr + n_rel) / len(words) if words else 0.0,
-    }
+    return (counter or _DEFAULT_COUNTER).count(text)
 
 
 def analyse_semantic_density(
     raw_prompts: list[str],
     rewritten_prompts: list[str],
     pipeline_name: str,
+    counter: Optional["SemanticCounter"] = None,
 ) -> dict[str, float]:
     """
-    Compare semantic density between raw and rewritten prompts.
+    Compare semantic content between raw and rewritten prompts.
+
+    Naming: attribute/relation values are COUNTS (per-prompt averages of raw
+    occurrence counts). semantic_density is the only true density — the
+    fraction (attributes + relations) / total_words.
 
     Returns a flat dict of aggregate stats for W&B logging.
     """
-    raw_stats = [count_semantic_tokens(p) for p in raw_prompts]
-    rw_stats = [count_semantic_tokens(p) for p in rewritten_prompts]
+    counter = counter or _DEFAULT_COUNTER
+    raw_stats = [counter.count(p) for p in raw_prompts]
+    rw_stats = [counter.count(p) for p in rewritten_prompts]
     n = len(raw_prompts)
 
     def avg(lst, key):
         return sum(d[key] for d in lst) / n if n else 0.0
 
     return {
-        f"{pipeline_name}/raw_attr_density":     avg(raw_stats, "n_attribute_tokens"),
-        f"{pipeline_name}/raw_rel_density":      avg(raw_stats, "n_relation_tokens"),
+        # counts (renamed from *_density — these are counts, not ratios)
+        f"{pipeline_name}/raw_attr_count":       avg(raw_stats, "n_attribute_tokens"),
+        f"{pipeline_name}/raw_rel_count":        avg(raw_stats, "n_relation_tokens"),
+        f"{pipeline_name}/rw_attr_count":        avg(rw_stats, "n_attribute_tokens"),
+        f"{pipeline_name}/rw_rel_count":         avg(rw_stats, "n_relation_tokens"),
+        f"{pipeline_name}/attr_count_gain":      avg(rw_stats, "n_attribute_tokens") - avg(raw_stats, "n_attribute_tokens"),
+        f"{pipeline_name}/rel_count_gain":       avg(rw_stats, "n_relation_tokens") - avg(raw_stats, "n_relation_tokens"),
+        # true density (the ratio)
         f"{pipeline_name}/raw_semantic_density": avg(raw_stats, "semantic_density"),
-        f"{pipeline_name}/rw_attr_density":      avg(rw_stats, "n_attribute_tokens"),
-        f"{pipeline_name}/rw_rel_density":       avg(rw_stats, "n_relation_tokens"),
         f"{pipeline_name}/rw_semantic_density":  avg(rw_stats, "semantic_density"),
-        f"{pipeline_name}/attr_density_gain":    avg(rw_stats, "n_attribute_tokens") - avg(raw_stats, "n_attribute_tokens"),
-        f"{pipeline_name}/rel_density_gain":     avg(rw_stats, "n_relation_tokens") - avg(raw_stats, "n_relation_tokens"),
     }
 
 
