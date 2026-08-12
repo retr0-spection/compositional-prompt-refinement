@@ -342,14 +342,47 @@ def _load_trace(path: Path) -> Optional[list[dict]]:
 
 
 def _save_summary(results: dict, path: Path) -> None:
+    """
+    Persist this process's results, then compose a combined summary across
+    ALL pipelines that have run.
+
+    The SLURM task runs each pipeline as a SEPARATE process (one per
+    --pipeline), so `results` here holds only the current pipeline. Writing
+    the .txt directly in "w" mode would clobber other pipelines' results
+    (the bug where only the last pipeline, llada_clip, survived in the
+    summary). Instead each process dumps its own results to a per-pipeline
+    JSON sidecar, and the .txt is rebuilt from every sidecar on disk.
+    """
+    path = Path(path)
+    parts_dir = path.parent / "_summary_parts"
+    parts_dir.mkdir(parents=True, exist_ok=True)
+
+    # 1. Write this process's own per-pipeline JSON sidecar(s).
+    for pipeline_name, set_results in results.items():
+        with open(parts_dir / f"{pipeline_name}.json", "w", encoding="utf-8") as f:
+            json.dump(set_results, f, indent=2, default=str)
+
+    # 2. Merge every sidecar on disk into the combined dict.
+    merged: dict = {}
+    for part in sorted(parts_dir.glob("*.json")):
+        try:
+            with open(part, encoding="utf-8") as f:
+                merged[part.stem] = json.load(f)
+        except (json.JSONDecodeError, OSError) as exc:
+            logger.warning("Skipping unreadable summary part %s (%s)", part, exc)
+
+    # 3. Rewrite the combined human-readable summary.
     with open(path, "w", encoding="utf-8") as f:
-        f.write("RQ2 — Compositional Benchmark Results\n")
+        f.write("RQ2 - Compositional Benchmark Results\n")
         f.write("=" * 50 + "\n\n")
-        for pipeline_name, set_results in results.items():
+        for pipeline_name in sorted(merged):
             f.write(f"Pipeline: {pipeline_name}\n")
-            for set_name, metrics in set_results.items():
+            for set_name, metrics in merged[pipeline_name].items():
                 f.write(f"  Set: {set_name}\n")
                 for k, v in sorted(metrics.items()):
-                    f.write(f"    {k}: {v:.4f}\n")
+                    try:
+                        f.write(f"    {k}: {float(v):.4f}\n")
+                    except (TypeError, ValueError):
+                        f.write(f"    {k}: {v}\n")
             f.write("\n")
-    logger.info("RQ2 summary saved to %s", path)
+    logger.info("RQ2 summary saved to %s (%d pipelines)", path, len(merged))
