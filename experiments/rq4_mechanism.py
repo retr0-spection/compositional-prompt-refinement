@@ -206,7 +206,7 @@ def _compare_mechanisms(
 
 
 def _save_summary(results: dict, path: Path) -> None:
-    with open(path, "w") as f:
+    with open(path, "w", encoding="utf-8") as f:
         f.write("RQ4 — Mechanism Comparison (AR vs LLaDA)\n")
         f.write("=" * 50 + "\n\n")
         for mechanism in ["ar", "llada"]:
@@ -222,4 +222,8 @@ def _save_summary(results: dict, path: Path) -> None:
         f.write("Mechanism Deltas (LLaDA − AR, positive = LLaDA wins):\n")
         for k, v in sorted(results["comparison"].items()):
             f.write(f"  {k}: {v:+.4f}\n")
+
+    # Persist comparison deltas as JSON for the RQ4 plot.
+    with open(path.parent / "rq4_comparison.json", "w", encoding="utf-8") as jf:
+        json.dump(results["comparison"], jf, indent=2, default=str)
     logger.info("RQ4 summary saved to %s", path)
