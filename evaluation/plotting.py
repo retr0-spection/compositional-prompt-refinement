@@ -205,9 +205,26 @@ def plot_rq1_density(rq1_dir: Path, out_dir: Path) -> None:
     w = 0.35
 
     def _get(p, key):
+        """
+        Look up a metric, tolerating (a) pipeline-prefixed vs bare keys and
+        (b) the pre-rename *_density names for what are now *_count metrics.
+        Old sidecars written before the density→count rename still plot.
+        """
         d = data[p]
-        # keys may be flat (llada_clip/raw_attr_density) or bare
-        for cand in (key, f"{p}/{key}"):
+        # Back-compat aliases: new count name -> possible old density name.
+        aliases = {
+            "raw_attr_count":  "raw_attr_density",
+            "rw_attr_count":   "rw_attr_density",
+            "raw_rel_count":   "raw_rel_density",
+            "rw_rel_count":    "rw_rel_density",
+            "attr_count_gain": "attr_density_gain",
+            "rel_count_gain":  "rel_density_gain",
+        }
+        candidates = [key, f"{p}/{key}"]
+        if key in aliases:
+            old = aliases[key]
+            candidates += [old, f"{p}/{old}"]
+        for cand in candidates:
             if cand in d:
                 return d[cand]
         return None
@@ -235,10 +252,105 @@ def plot_rq1_density(rq1_dir: Path, out_dir: Path) -> None:
         ax.set_title("RQ1 — embedding separation gain (negative = CLIP clustering)")
         _save(fig, out_dir, "rq1_separation_gain")
 
+    # Semantic density ratio: raw vs rewritten fraction of compositional words.
+    # Distinct from the counts above — this is (attrs+rels)/total_words, so it
+    # shows whether rewriting CONCENTRATES compositional content or dilutes it
+    # with descriptive prose (the RQ1 finding: counts rise but density falls).
+    raw_den = [_get(p, "raw_semantic_density") for p in pipes]
+    rw_den  = [_get(p, "rw_semantic_density") for p in pipes]
+    if any(d is not None for d in raw_den + rw_den):
+        fig, ax = plt.subplots(figsize=(1.4 * len(pipes) + 3, 4.5))
+        ax.bar(x - w/2, [d or 0 for d in raw_den], w, label="raw", color="#BBBBBB")
+        ax.bar(x + w/2, [d or 0 for d in rw_den],  w, label="rewritten", color="#7B5EA7")
+        ax.set_xticks(x); ax.set_xticklabels(pipes, rotation=20, ha="right")
+        ax.set_ylabel("Semantic density (fraction of words)")
+        ax.set_title("RQ1 — semantic density: raw vs rewritten "
+                     "(ratio, not count)")
+        ax.legend(fontsize=9)
+        _save(fig, out_dir, "rq1_semantic_density")
+
 
 # ---------------------------------------------------------------------------
 # Plot 1: per-set grouped bars, one metric, pipelines side by side
 # ---------------------------------------------------------------------------
+
+def load_rq2_sidecars(rq2_dir: Path) -> dict[str, dict]:
+    """
+    Return {pipeline: {set: metrics}} from RQ2 per-pipeline sidecars.
+
+    These carry set-level metrics that the per-prompt traces do NOT — notably
+    FID, which is a distribution statistic over the whole image set and so was
+    never written per-prompt. Reads outputs/rq2/_summary_parts/<pipeline>.json.
+    """
+    parts = Path(rq2_dir) / "_summary_parts"
+    out: dict[str, dict] = {}
+    if not parts.is_dir():
+        logger.info("No RQ2 sidecars in %s — skipping FID plot.", parts)
+        return out
+    for f in sorted(parts.glob("*.json")):
+        try:
+            out[f.stem] = json.loads(f.read_text(encoding="utf-8"))
+        except Exception as exc:
+            logger.warning("Could not read RQ2 sidecar %s (%s)", f, exc)
+    return out
+
+
+def plot_rq2_fid(rq2_dir: Path, out_dir: Path) -> None:
+    """
+    FID grouped bars: x = eval set, bars = pipelines, y = FID (lower better).
+
+    FID lives in the RQ2 sidecars, not the traces, which is why the trace-based
+    bar plotter never showed it. Reads the sidecars directly.
+
+    NOTE: per-set FID at ~50 images is high-variance and biased upward; treat
+    cross-pipeline differences within a set as indicative, not absolute
+    magnitudes. A pooled FID (all sets per pipeline) is more defensible — see
+    the horizontal line per pipeline showing its mean FID across sets.
+    """
+    plt = _style()
+    data = load_rq2_sidecars(rq2_dir)
+    if not data:
+        return
+    import numpy as np
+
+    pipelines = [p for p in _PIPELINE_ORDER if p in data]
+    all_sets = sorted({s for p in data.values() for s in p})
+
+    # Extract fid per (pipeline, set); key form: '<pipeline>/<set>/fid'.
+    def _fid(pipe, s):
+        metrics = data.get(pipe, {}).get(s, {})
+        return metrics.get(f"{pipe}/{s}/fid")
+
+    # Bail if no FID anywhere (e.g. run without a reference set).
+    if not any(_fid(p, s) is not None for p in pipelines for s in all_sets):
+        logger.info("RQ2 sidecars contain no FID values — skipping FID plot.")
+        return
+
+    x = np.arange(len(all_sets))
+    width = 0.8 / max(len(pipelines), 1)
+    fig, ax = plt.subplots(figsize=(1.6 * len(all_sets) + 2, 4.5))
+
+    for j, pipe in enumerate(pipelines):
+        ys = [_fid(pipe, s) for s in all_sets]
+        xs = [x[k] + (j - len(pipelines) / 2 + 0.5) * width
+              for k, y in enumerate(ys) if y is not None]
+        yvals = [y for y in ys if y is not None]
+        ax.bar(xs, yvals, width, label=pipe,
+               color=_PIPELINE_COLOURS.get(pipe, "#333"))
+        # Pooled mean FID across this pipeline's sets, as a reference line.
+        pooled = [y for y in ys if y is not None]
+        if pooled:
+            ax.axhline(np.mean(pooled), color=_PIPELINE_COLOURS.get(pipe, "#333"),
+                       linewidth=0.8, linestyle=":", alpha=0.6)
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(all_sets, rotation=30, ha="right")
+    ax.set_ylabel("FID (lower = better)")
+    ax.set_title("RQ2 — FID by set and pipeline (dotted = pipeline mean; "
+                 "per-set FID is noisy at small N)")
+    ax.legend(ncol=min(3, len(pipelines)), fontsize=9)
+    _save(fig, out_dir, "rq2_fid")
+
 
 def plot_rq2_bars(
     rq2_dir: Path,
@@ -425,6 +537,41 @@ def plot_trajectory(
 # One-call driver
 # ---------------------------------------------------------------------------
 
+def plot_rq3_stability(rq3_dir: Path, out_dir: Path) -> None:
+    """
+    RQ3 compositional stability: one bar per pipeline (higher = less sensitive
+    to CFG scale). Reads the compositional_stability field from RQ3 sidecars.
+
+    Stability = 1 - mean(coefficient of variation) across metrics over the CFG
+    sweep, so it is comparable across pipelines despite metrics living on
+    different scales.
+    """
+    plt = _style()
+    sweeps = load_rq3_sweeps(rq3_dir)
+    if not sweeps:
+        return
+    import numpy as np
+
+    pipes = [p for p in _PIPELINE_ORDER if p in sweeps]
+    vals = [sweeps[p].get("compositional_stability") for p in pipes]
+    # keep only pipelines with a real (non-NaN) stability value
+    pairs = [(p, v) for p, v in zip(pipes, vals)
+             if v is not None and not (isinstance(v, float) and v != v)]
+    if not pairs:
+        logger.info("No RQ3 stability values — skipping stability plot.")
+        return
+    pipes, vals = zip(*pairs)
+
+    fig, ax = plt.subplots(figsize=(1.3 * len(pipes) + 3, 4.5))
+    x = np.arange(len(pipes))
+    ax.bar(x, vals, color=[_PIPELINE_COLOURS.get(p, "#333") for p in pipes])
+    ax.set_xticks(x); ax.set_xticklabels(pipes, rotation=20, ha="right")
+    ax.set_ylabel("Compositional stability (higher = more CFG-robust)")
+    ax.set_title("RQ3 — compositional stability across CFG scales")
+    ax.set_ylim(top=1.0)
+    _save(fig, out_dir, "rq3_stability")
+
+
 def plot_rq4_deltas(rq4_dir: Path, out_dir: Path) -> None:
     """
     RQ4 mechanism comparison: diverging bars of (LLaDA - AR) per metric per set.
@@ -518,6 +665,9 @@ def generate_all_plots(
     for m in ("clip_score", "attr", "relation"):
         plot_rq2_bars(root / "rq2", plot_dir, metric=m)
 
+    # RQ2 FID — reads sidecars (traces don't carry FID).
+    plot_rq2_fid(root / "rq2", plot_dir)
+
     # RQ4 mechanism deltas (LLaDA vs AR) — the core comparison plot.
     plot_rq4_deltas(root / "rq4", plot_dir)
 
@@ -528,6 +678,9 @@ def generate_all_plots(
             plot_cfg_sweep(sweeps, plot_dir, metric=m)
     else:
         logger.info("No RQ3 data (memory or disk) — CFG sweep plots skipped.")
+
+    # RQ3 compositional stability bars.
+    plot_rq3_stability(root / "rq3", plot_dir)
 
     # Denoising trajectory — only if instrumented.
     for m in ("clip_score",):
