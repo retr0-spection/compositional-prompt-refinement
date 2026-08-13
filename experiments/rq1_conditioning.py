@@ -109,8 +109,8 @@ def run_rq1(
                 "token_count_raw": enc.token_count_raw,
                 "token_count_rewritten": enc.token_count_rewritten,
                 "was_truncated": enc.was_truncated,
-                "raw_semantic_density": count_semantic_tokens(enc.raw_prompt),
-                "rw_semantic_density": count_semantic_tokens(enc.rewritten_prompt),
+                "raw_semantic_counts": count_semantic_tokens(enc.raw_prompt),
+                "rw_semantic_counts": count_semantic_tokens(enc.rewritten_prompt),
             })
         trace_path = output_dir / f"trace_{pipeline.name}.jsonl"
         with open(trace_path, "w", encoding="utf-8") as f:
@@ -122,11 +122,10 @@ def run_rq1(
             log_metrics(combined)
 
         logger.info(
-            "[RQ1][%s] Semantic density gain: attr=%.2f, rel=%.2f | "
-            "Separation gain: %.4f",
+            "[RQ1][%s] Count gain: attr=%.2f, rel=%.2f | Separation gain: %.4f",
             pipeline.name,
-            density_stats.get(f"{pipeline.name}/attr_density_gain", 0),
-            density_stats.get(f"{pipeline.name}/rel_density_gain", 0),
+            density_stats.get(f"{pipeline.name}/attr_count_gain", 0),
+            density_stats.get(f"{pipeline.name}/rel_count_gain", 0),
             separation_stats.get(f"{pipeline.name}/separation_gain", 0),
         )
 

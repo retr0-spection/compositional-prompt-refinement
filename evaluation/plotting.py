@@ -212,15 +212,15 @@ def plot_rq1_density(rq1_dir: Path, out_dir: Path) -> None:
                 return d[cand]
         return None
 
-    raw_attr = [_get(p, "raw_attr_density") or 0 for p in pipes]
-    rw_attr  = [_get(p, "rw_attr_density") or 0 for p in pipes]
+    raw_attr = [_get(p, "raw_attr_count") or 0 for p in pipes]
+    rw_attr  = [_get(p, "rw_attr_count") or 0 for p in pipes]
     ax.bar(x - w/2, raw_attr, w, label="raw", color="#BBBBBB")
     ax.bar(x + w/2, rw_attr,  w, label="rewritten", color="#7B5EA7")
     ax.set_xticks(x); ax.set_xticklabels(pipes, rotation=20, ha="right")
-    ax.set_ylabel("Attribute density (count/prompt)")
-    ax.set_title("RQ1 — attribute density: raw vs rewritten")
+    ax.set_ylabel("Attribute count (per prompt)")
+    ax.set_title("RQ1 — attribute count: raw vs rewritten")
     ax.legend(fontsize=9)
-    _save(fig, out_dir, "rq1_attr_density")
+    _save(fig, out_dir, "rq1_attr_count")
 
     # Separation gain (single bar per pipeline; negative = CLIP clustering).
     sep = [_get(p, "separation_gain") for p in pipes]
@@ -425,6 +425,77 @@ def plot_trajectory(
 # One-call driver
 # ---------------------------------------------------------------------------
 
+def plot_rq4_deltas(rq4_dir: Path, out_dir: Path) -> None:
+    """
+    RQ4 mechanism comparison: diverging bars of (LLaDA - AR) per metric per set.
+
+    Reads outputs/rq4/rq4_comparison.json (keys like
+    'delta_clip/color_binding/attr_binding_accuracy'). Bars above zero mean
+    LLaDA (diffusion) beats AR; below zero means AR wins. This is the core
+    RQ4 visual — the mechanism question.
+    """
+    plt = _style()
+    comp_path = Path(rq4_dir) / "rq4_comparison.json"
+    if not comp_path.exists():
+        logger.info("No %s — skipping RQ4 delta plot.", comp_path)
+        return
+    try:
+        deltas = json.loads(comp_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        logger.warning("Could not read RQ4 comparison (%s)", exc)
+        return
+    if not deltas:
+        return
+
+    import numpy as np
+    # Parse keys: delta_<encoder>/<set>/<metric>
+    parsed = []
+    for k, v in deltas.items():
+        try:
+            enc_part, set_name, metric = k.split("/")
+            encoder = enc_part.replace("delta_", "")
+        except ValueError:
+            continue
+        if v != v:  # skip NaN deltas
+            continue
+        parsed.append((encoder, set_name, metric, v))
+    if not parsed:
+        return
+
+    metrics = sorted({p[2] for p in parsed})
+    metric_labels = {
+        "clip_score": "CLIPScore",
+        "attr_binding_accuracy": "Attribute binding",
+        "relation_accuracy": "Relation accuracy",
+    }
+
+    # One subplot per metric; x = set (× encoder), y = delta.
+    fig, axes = plt.subplots(
+        1, len(metrics), figsize=(4.2 * len(metrics), 4.5), sharey=False
+    )
+    if len(metrics) == 1:
+        axes = [axes]
+
+    for ax, metric in zip(axes, metrics):
+        rows = [(f"{s}\n({e})", v) for e, s, m, v in parsed if m == metric]
+        rows.sort(key=lambda r: r[1])
+        labels = [r[0] for r in rows]
+        vals = [r[1] for r in rows]
+        colours = ["#7B5EA7" if v >= 0 else "#C0504D" for v in vals]
+        y = np.arange(len(labels))
+        ax.barh(y, vals, color=colours)
+        ax.axvline(0, color="#333", linewidth=0.8)
+        ax.set_yticks(y)
+        ax.set_yticklabels(labels, fontsize=8)
+        ax.set_xlabel("LLaDA - AR")
+        ax.set_title(metric_labels.get(metric, metric), fontsize=10)
+
+    fig.suptitle("RQ4 - Mechanism deltas (>0: diffusion beats autoregressive)",
+                 fontsize=11)
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
+    _save(fig, out_dir, "rq4_mechanism_deltas")
+
+
 def generate_all_plots(
     output_root: str | Path = "outputs",
     rq3_results: Optional[dict] = None,
@@ -446,6 +517,9 @@ def generate_all_plots(
     # RQ2 bars — CLIPScore always; accuracy metrics where applicable.
     for m in ("clip_score", "attr", "relation"):
         plot_rq2_bars(root / "rq2", plot_dir, metric=m)
+
+    # RQ4 mechanism deltas (LLaDA vs AR) — the core comparison plot.
+    plot_rq4_deltas(root / "rq4", plot_dir)
 
     # RQ3 CFG sweeps — prefer in-memory dict, else load from disk sidecars.
     sweeps = rq3_results or load_rq3_sweeps(root / "rq3")
