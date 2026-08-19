@@ -9,6 +9,24 @@ t2i_model: sd2-community/stable-diffusion-2-1
 clip_model: laion/CLIP-ViT-H-14-laion2B-s32B-b79K   # matches SD 2.1 text encoder
 longclip_checkpoint: null  # local path to longclip-L.pt, or null to auto-download
 
+# ---------------------------------------------------------------------------
+# T2I backbone (read by T2IRunnerV2). Switch the whole experiment between
+# SD 2.1 and SDXL here. Each backbone uses its NATIVE encoder(s):
+#   sd21 -> single CLIP-H          (768x768, v_prediction)
+#   sdxl -> dual bigG + L + pooled (1024x1024, epsilon)
+# Only `backbone` is required; the rest fall back to per-backbone defaults
+# in T2IRunnerV2Config.from_dict(). The old flat keys above (t2i_model,
+# image_size) still drive the legacy embedding-in runner.
+# ---------------------------------------------------------------------------
+t2i:
+  backbone: sd21                                      # sd21 | sdxl
+  # model_id: stabilityai/stable-diffusion-xl-base-1.0  # override per backbone
+  # resolution: 1024
+  # prediction_type: epsilon
+  num_inference_steps: 100
+  default_cfg_scale: 7.5
+  use_karras_sigmas: true
+
 llada_model: GSAI-ML/LLaDA-8B-Instruct
 ollama_model: llama3.1
 ollama_base_url: http://localhost:11434

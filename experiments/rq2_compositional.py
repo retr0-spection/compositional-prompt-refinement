@@ -141,11 +141,22 @@ def run_rq2(
                     pipeline.name, set_name,
                     len(prompts) - len(missing), len(prompts), len(missing),
                 )
-                new_images = runner.generate_batch(
-                    prompt_embeds_list=[enc_results[i].embedding for i in missing],
-                    cfg_scale=cfg_scale,
-                    seeds=[seed] * len(missing),
-                )
+                # Backbone-agnostic generation. T2IRunnerV2 takes rewritten
+                # TEXT and encodes internally (native single/dual encoder);
+                # the legacy T2IRunner takes pre-computed embeddings. Detect
+                # which interface this runner exposes and call accordingly.
+                if hasattr(runner, "_encode"):  # T2IRunnerV2 (text-in)
+                    new_images = runner.generate_batch(
+                        prompts=[enc_results[i].rewritten_prompt for i in missing],
+                        cfg_scale=cfg_scale,
+                        seeds=[seed] * len(missing),
+                    )
+                else:  # legacy embedding-in runner
+                    new_images = runner.generate_batch(
+                        prompt_embeds_list=[enc_results[i].embedding for i in missing],
+                        cfg_scale=cfg_scale,
+                        seeds=[seed] * len(missing),
+                    )
                 for i, img in zip(missing, new_images):
                     img.save(img_paths[i])
                     images[i] = img

@@ -86,12 +86,20 @@ def run_rq4(
                 pipeline_name=pipeline.name,
             )
 
-            # Generate images
-            images = runner.generate_batch(
-                prompt_embeds_list=embeddings,
-                cfg_scale=cfg_scale,
-                seeds=[seed] * len(prompts),
-            )
+            # Generate images. Backbone-agnostic: v2 runner takes rewritten
+            # text and encodes natively; legacy runner takes embeddings.
+            if hasattr(runner, "_encode"):  # T2IRunnerV2 (text-in)
+                images = runner.generate_batch(
+                    prompts=rewritten_prompts,
+                    cfg_scale=cfg_scale,
+                    seeds=[seed] * len(prompts),
+                )
+            else:  # legacy embedding-in runner
+                images = runner.generate_batch(
+                    prompt_embeds_list=embeddings,
+                    cfg_scale=cfg_scale,
+                    seeds=[seed] * len(prompts),
+                )
 
             # Save images
             img_dir = output_dir / pipeline.name / set_name
