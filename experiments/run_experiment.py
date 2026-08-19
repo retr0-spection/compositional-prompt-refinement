@@ -144,10 +144,31 @@ def build_pipelines(cfg: dict, dry_run: bool = False) -> list:
 
 
 def build_runner(cfg: dict, dry_run: bool = False):
-    """Build the T2I image generation runner."""
-    from generation.t2i_runner import T2IRunner, T2IRunnerConfig
+    """
+    Build the T2I image generation runner.
+
+    If the config has a `t2i:` block, use the backbone-agnostic T2IRunnerV2
+    (text-in, supports sd21 and sdxl). Otherwise fall back to the legacy
+    embedding-in T2IRunner (sd21 only) driven by the flat t2i_model/image_size
+    keys. This lets the SDXL swap be a pure config change.
+    """
     device = "cpu" if dry_run else ("cuda" if torch.cuda.is_available() else "cpu")
     dtype = torch.float32 if device == "cpu" else torch.float16
+
+    if "t2i" in cfg:
+        from generation.t2i_runner_v2 import T2IRunnerV2, T2IRunnerV2Config
+        runner_cfg = T2IRunnerV2Config.from_dict(cfg)
+        # Apply runtime overrides the block doesn't carry.
+        runner_cfg.device = device
+        runner_cfg.torch_dtype = dtype
+        if dry_run:
+            runner_cfg.num_inference_steps = 2
+        logger.info("Using T2IRunnerV2 | backbone=%s | model=%s | res=%d",
+                    runner_cfg.backbone, runner_cfg.model_id, runner_cfg.resolution)
+        return T2IRunnerV2(config=runner_cfg)
+
+    # Legacy path (no t2i: block).
+    from generation.t2i_runner import T2IRunner, T2IRunnerConfig
     runner_cfg = T2IRunnerConfig(
         model_id=cfg.get("t2i_model", "stabilityai/stable-diffusion-2-1"),
         device=device,
@@ -157,6 +178,7 @@ def build_runner(cfg: dict, dry_run: bool = False):
         image_height=cfg.get("image_size", 768),
         image_width=cfg.get("image_size", 768),
     )
+    logger.info("Using legacy T2IRunner (embedding-in, sd21).")
     return T2IRunner(config=runner_cfg)
 
 

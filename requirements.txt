@@ -26,8 +26,11 @@
 #   4.48–4.5x satisfies BOTH. Do NOT bump to 5.x without re-testing LLaDA load.
 transformers>=4.48,<5.0
 accelerate>=0.27.0            # required by diffusers, and by low_cpu_mem_usage LLaDA load
-diffusers>=0.27.0             # T2I backbone (Stable Diffusion 2.1)
-safetensors>=0.4.2           # fast weight loading for HF models
+# diffusers: SDXL support is stable from 0.24+; callback_on_step_end (used by
+# the denoising-trajectory instrumentation) needs >=0.27. SDXL loads the
+# StableDiffusionXLPipeline + dual text encoders from this package.
+diffusers>=0.27.0            # T2I backbones (Stable Diffusion 2.1 AND SDXL)
+safetensors>=0.4.2           # fast weight loading; SDXL ships safetensors-only
 
 # CLIP / Long-CLIP
 open-clip-torch>=2.24.0       # optional: used if you swap to open_clip encoders
@@ -43,6 +46,15 @@ requests>=2.31.0
 
 # Image processing
 Pillow>=10.0.0
+
+# SDXL note
+# ---------
+# SDXL base (stabilityai/stable-diffusion-xl-base-1.0) needs no extra packages
+# beyond diffusers + transformers + safetensors above, but at 1024x1024 it is
+# ~7 GB of weights + dual encoders. invisible-watermark is OPTIONAL — diffusers
+# only imports it if watermarking is enabled (it is not, in this pipeline).
+# If a future diffusers version warns about it, uncomment:
+# invisible-watermark>=0.2.0
 
 # Evaluation
 scipy>=1.11.0                 # FID computation

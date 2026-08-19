@@ -66,6 +66,25 @@ TIME_RQ2="12:00:00"         # RQ2: image gen (50 steps × 500 prompts) + BLIP-2 
 TIME_RQ3="06:00:00"         # RQ3: CFG sweep over 25 prompts × 5 scales
 TIME_RQ4="08:00:00"         # RQ4: AR vs LLaDA head-to-head
 
+# ---------------------------------------------------------------------------
+# Backbone-aware resource sizing.
+# The above limits are tuned for SD 2.1 @ 768². SDXL @ 1024² is ~2-4x slower
+# per image and uses more host RAM (dual encoders + larger buffers), so raise
+# the generation-heavy RQ limits when the config selects the sdxl backbone.
+# Rewrite warmups are backbone-agnostic (they populate caches) and unchanged.
+# This reads config/experiment.yaml so `backbone: sdxl` adjusts the model AND
+# the SLURM budget from one switch. Only ever RAISES limits; sd21 is untouched.
+# ---------------------------------------------------------------------------
+if grep -qE '^\s*backbone:\s*sdxl' "${REPO_ROOT}/config/experiment.yaml" 2>/dev/null; then
+    echo "Detected SDXL backbone — applying larger time/memory budgets."
+    TIME_RQ2="24:00:00"
+    TIME_RQ3="12:00:00"
+    TIME_RQ4="18:00:00"
+    MEM_RQ2="24G"
+    MEM_RQ3="12G"
+    MEM_RQ4="24G"
+fi
+
 VENV="$REPO_ROOT/venv"
 LOG_DIR="$REPO_ROOT/logs/slurm"
 mkdir -p "$LOG_DIR"

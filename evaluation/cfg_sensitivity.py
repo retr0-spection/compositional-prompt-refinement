@@ -155,20 +155,31 @@ def sweep_cfg_scales(
 
     logger.info("[%s] Starting CFG sweep over scales: %s", pipeline.name, cfg_scales)
 
-    # Encode once — same embeddings used for all CFG scales
+    # Encode once — reused across all CFG scales (only needed for the legacy
+    # embedding-in runner; the v2 text-in runner encodes per generate call).
     logger.info("[%s] Encoding %d prompts...", pipeline.name, len(prompts))
     encoding_results = pipeline.encode_batch(prompts)
     embeddings = [r.embedding for r in encoding_results]
+    rewritten = [r.rewritten_prompt for r in encoding_results]
     seeds = [seed] * len(prompts)
+    _v2_runner = hasattr(runner, "_encode")
 
     for scale in cfg_scales:
         logger.info("[%s] Generating at CFG scale %.1f", pipeline.name, scale)
 
-        images: list[Image.Image] = runner.generate_batch(
-            prompt_embeds_list=embeddings,
-            cfg_scale=scale,
-            seeds=seeds,
-        )
+        # Backbone-agnostic: v2 runner takes rewritten text, legacy takes embeds.
+        if _v2_runner:
+            images: list[Image.Image] = runner.generate_batch(
+                prompts=rewritten,
+                cfg_scale=scale,
+                seeds=seeds,
+            )
+        else:
+            images = runner.generate_batch(
+                prompt_embeds_list=embeddings,
+                cfg_scale=scale,
+                seeds=seeds,
+            )
 
         if output_dir:
             scale_dir = Path(output_dir) / pipeline.name / f"cfg{scale}"
