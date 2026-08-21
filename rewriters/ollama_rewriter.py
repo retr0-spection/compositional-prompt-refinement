@@ -18,7 +18,8 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 from typing import Optional
 
 import requests
@@ -26,6 +27,55 @@ import requests
 from rewriters.base import PromptRewriter
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Shared timing accumulator (used by both AR and LLaDA rewriters)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class RewriteTimingStats:
+    """
+    Accumulates wall-clock timing for rewrite inference.
+
+    Only real inference is timed — cache hits are excluded (they cost ~0 and
+    would bias the mean downward). This gives an honest AR-vs-LLaDA cost
+    comparison for the mechanism tradeoff discussion: if LLaDA wins on quality
+    but costs Nx the wall-clock, that N is a first-class finding.
+    """
+    mechanism: str = ""           # 'ar' | 'llada'
+    times: list[float] = field(default_factory=list)   # seconds per real rewrite
+
+    def record(self, seconds: float) -> None:
+        self.times.append(seconds)
+
+    @property
+    def n(self) -> int:
+        return len(self.times)
+
+    @property
+    def total(self) -> float:
+        return sum(self.times)
+
+    @property
+    def mean(self) -> float:
+        return sum(self.times) / len(self.times) if self.times else 0.0
+
+    def summary(self) -> dict:
+        if not self.times:
+            return {"mechanism": self.mechanism, "n": 0}
+        srt = sorted(self.times)
+        mid = len(srt) // 2
+        median = srt[mid] if len(srt) % 2 else (srt[mid - 1] + srt[mid]) / 2
+        return {
+            "mechanism": self.mechanism,
+            "n": self.n,
+            "total_seconds": round(self.total, 3),
+            "mean_seconds": round(self.mean, 4),
+            "median_seconds": round(median, 4),
+            "min_seconds": round(srt[0], 4),
+            "max_seconds": round(srt[-1], 4),
+        }
 
 # Identical wording to LLaDARewriter._EXPANSION_INSTRUCTION.
 # Do not change one without changing the other — they must match for RQ4.
@@ -84,6 +134,7 @@ class OllamaRewriter(PromptRewriter):
         self.config = config or OllamaRewriterConfig()
         self._model_ready: bool = False
         self._cache: dict[str, str] = {}
+        self.timing = RewriteTimingStats(mechanism="ar")
         if self.config.cache_path:
             self._load_cache()
 
@@ -224,7 +275,10 @@ class OllamaRewriter(PromptRewriter):
             return self._cache[prompt]
         self._ensure_model()
         user_content = self.config.expansion_instruction.format(prompt=prompt)
+        # Time only the real inference call (excludes cache hits and model pull).
+        _t0 = time.perf_counter()
         expanded = self._chat(user_content)
+        self.timing.record(time.perf_counter() - _t0)
         logger.debug("Ollama expanded %r -> %r", prompt, expanded)
         self._cache[prompt] = expanded
         if self.config.cache_path:

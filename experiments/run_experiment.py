@@ -369,6 +369,7 @@ def main() -> None:
 
         pipelines = _filter_pipelines(build_pipelines(cfg, dry_run=False))
 
+        timing_summaries = {}
         for pipeline in pipelines:
             if isinstance(pipeline, RawPipeline):
                 logger.info("Skipping %s — no rewriter to cache.", pipeline.name)
@@ -379,6 +380,40 @@ def main() -> None:
             )
             pipeline.encode_batch(all_prompts)
             logger.info("Cache warm for %s.", pipeline.name)
+
+            # Collect language-layer inference timing (AR vs LLaDA wall-clock).
+            # The rewriter accumulated per-rewrite seconds during encode_batch;
+            # only REAL inference is counted (cache hits excluded). If every
+            # prompt was already cached, n=0 and we skip.
+            rewriter = getattr(pipeline, "_rewriter", None)
+            timing = getattr(rewriter, "timing", None)
+            if timing is not None and timing.n > 0:
+                summ = timing.summary()
+                timing_summaries[pipeline.name] = summ
+                logger.info(
+                    "[timing] %s: %d rewrites | mean %.3fs | median %.3fs | total %.1fs",
+                    pipeline.name, summ["n"], summ["mean_seconds"],
+                    summ["median_seconds"], summ["total_seconds"],
+                )
+
+        # Persist timing so it survives the warmup job and can be plotted /
+        # compared across mechanisms. Merges with any existing file so AR and
+        # LLaDA warmups (separate SLURM jobs) both land in one place.
+        if timing_summaries:
+            import json
+            timing_path = output_dir / "rewrite_timing.json"
+            timing_path.parent.mkdir(parents=True, exist_ok=True)
+            existing = {}
+            if timing_path.exists():
+                try:
+                    with open(timing_path, encoding="utf-8") as f:
+                        existing = json.load(f)
+                except (json.JSONDecodeError, OSError):
+                    pass
+            existing.update(timing_summaries)
+            with open(timing_path, "w", encoding="utf-8") as f:
+                json.dump(existing, f, indent=2)
+            logger.info("Rewrite timing written to %s", timing_path)
 
         logger.info("Rewrite cache complete. Exiting.")
         if wandb_log:

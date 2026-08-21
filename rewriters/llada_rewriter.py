@@ -21,6 +21,7 @@ Key facts that shape this implementation:
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -30,6 +31,7 @@ import torch.nn.functional as F
 from transformers import AutoModel, AutoTokenizer
 
 from rewriters.base import PromptRewriter
+from rewriters.ollama_rewriter import RewriteTimingStats
 
 logger = logging.getLogger(__name__)
 
@@ -222,6 +224,7 @@ class LLaDARewriter(PromptRewriter):
         self._model: Optional[AutoModel] = None
         self._tokenizer: Optional[AutoTokenizer] = None
         self._cache: dict[str, str] = {}
+        self.timing = RewriteTimingStats(mechanism="llada")
         if self.config.cache_path:
             self._load_cache()
 
@@ -342,6 +345,7 @@ class LLaDARewriter(PromptRewriter):
         input_ids = encoded["input_ids"].to(cfg.device)
         attention_mask = encoded["attention_mask"].to(cfg.device)
 
+        _t0 = time.perf_counter()
         out = _generate(
             model=self._model,
             prompt=input_ids,
@@ -353,6 +357,12 @@ class LLaDARewriter(PromptRewriter):
             cfg_scale=cfg.cfg_scale,
             remasking=cfg.remasking,
         )
+        # Time the diffusion generate call (the real inference cost).
+        # torch.cuda.synchronize ensures the timer captures GPU work, not just
+        # kernel-launch time (CUDA is async).
+        if cfg.device == "cuda":
+            torch.cuda.synchronize()
+        self.timing.record(time.perf_counter() - _t0)
 
         # Slice off prompt tokens; decode only the generated response.
         response_ids = out[:, input_ids.shape[1]:]
@@ -433,6 +443,7 @@ class LLaDARewriter(PromptRewriter):
             input_ids = encoded["input_ids"].to(cfg.device)
             attention_mask = encoded["attention_mask"].to(cfg.device)
 
+            _t0 = time.perf_counter()
             out = _generate(
                 model=self._model,
                 prompt=input_ids,
@@ -444,6 +455,13 @@ class LLaDARewriter(PromptRewriter):
                 cfg_scale=cfg.cfg_scale,
                 remasking=cfg.remasking,
             )
+            if cfg.device == "cuda":
+                torch.cuda.synchronize()
+            # Record per-prompt time (chunk wall-clock / chunk size) so units
+            # match the single-prompt path and AR's per-rewrite timing.
+            _chunk_secs = time.perf_counter() - _t0
+            for _ in chunk_idx:
+                self.timing.record(_chunk_secs / len(chunk_idx))
 
             response_ids = out[:, input_ids.shape[1]:]
             expanded = self._tokenizer.batch_decode(response_ids, skip_special_tokens=True)
