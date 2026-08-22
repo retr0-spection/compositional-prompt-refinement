@@ -181,6 +181,133 @@ def _generate(
 
 
 # ---------------------------------------------------------------------------
+# Product-of-Experts joint denoising (RQ5 capstone)
+# ---------------------------------------------------------------------------
+# Standard _generate conditions on ONE prompt. PoE conditions on MULTIPLE
+# constraint prompts simultaneously and combines their per-token logits at
+# every unmasking step:
+#
+#     log p(x) = sum_i log p_i(x)  (+ normalisation)
+#
+# i.e. the token distributions of N "experts" (one per constraint) are
+# multiplied — a token is only confidently unmasked if ALL experts agree.
+# This is the compositional operation an autoregressive model structurally
+# cannot perform: AR commits tokens left-to-right conditioned on already-fixed
+# outputs, so it cannot hold N constraints in superposition and resolve them
+# jointly. LLaDA's parallel unmasking exposes exactly the hook PoE needs.
+#
+# Each expert shares the SAME masked canvas x (same tokens unmasked so far);
+# they differ only in their conditioning prefix. We run one forward pass per
+# expert per step, sum the log-softmax distributions, and unmask from the
+# combined confidence.
+
+@torch.no_grad()
+def _generate_poe(
+    model,
+    expert_prompts: list[torch.Tensor],   # list of (1, Li) conditioning prefixes
+    gen_length: int = 128,
+    steps: int = 128,
+    block_length: int = 32,
+    temperature: float = 0.0,
+    remasking: str = "low_confidence",
+    mask_id: int = _MASK_ID,
+    device: str = "cuda",
+) -> torch.Tensor:
+    """
+    Joint masked-diffusion denoising under a product of N expert constraints.
+
+    Returns the generated response ids (gen_length tokens) satisfying all
+    experts jointly. Experts are conditioning prefixes (already tokenised);
+    each gets its own canvas [prefix_i | shared_response], but the RESPONSE
+    region is kept in lock-step across experts — the same positions unmask at
+    the same step, driven by the summed (product-of-experts) confidence.
+    """
+    n_exp = len(expert_prompts)
+    assert n_exp >= 1
+    assert gen_length % block_length == 0
+    num_blocks = gen_length // block_length
+    assert steps % num_blocks == 0
+    steps_per_block = steps // num_blocks
+
+    # Build one canvas per expert: [expert_prefix | masked response].
+    # The response region (last gen_length tokens) is shared logically — we
+    # keep it identical across experts after every unmask.
+    canvases = []
+    prefix_lens = []
+    for pfx in expert_prompts:
+        pfx = pfx.to(device)
+        L = pfx.shape[1]
+        prefix_lens.append(L)
+        x = torch.full((1, L + gen_length), mask_id, dtype=torch.long, device=device)
+        x[:, :L] = pfx.clone()
+        canvases.append(x)
+
+    # Response positions within each canvas start at prefix_len.
+    def _resp_slice(e):
+        return slice(prefix_lens[e], prefix_lens[e] + gen_length)
+
+    for num_block in range(num_blocks):
+        blk_lo = num_block * block_length
+        blk_hi = (num_block + 1) * block_length
+        # mask index over the RESPONSE region (shared shape across experts)
+        resp0 = canvases[0][:, _resp_slice(0)]
+        block_mask = resp0[:, blk_lo:blk_hi] == mask_id
+        num_transfer = _get_num_transfer_tokens(block_mask, steps_per_block)
+
+        for i in range(steps_per_block):
+            # Response-region mask (identical across experts by construction).
+            resp = canvases[0][:, _resp_slice(0)]
+            mask_index = resp == mask_id  # (1, gen_length)
+
+            # Sum log-softmax over experts = product of expert distributions.
+            summed_logprobs = None
+            for e, x in enumerate(canvases):
+                logits = model(x).logits                    # (1, Le, vocab)
+                resp_logits = logits[:, _resp_slice(e), :]  # (1, gen_length, vocab)
+                lp = F.log_softmax(resp_logits.to(torch.float64), dim=-1)
+                summed_logprobs = lp if summed_logprobs is None else summed_logprobs + lp
+
+            # Renormalise the product distribution.
+            combined = F.log_softmax(summed_logprobs, dim=-1)  # (1, gen_length, vocab)
+
+            noised = _add_gumbel_noise(combined, temperature=temperature)
+            x0 = torch.argmax(noised, dim=-1)                  # (1, gen_length)
+
+            if remasking == "low_confidence":
+                probs = combined.exp()
+                x0_p = torch.squeeze(
+                    torch.gather(probs, -1, x0.unsqueeze(-1)), -1)
+            elif remasking == "random":
+                x0_p = torch.rand((1, gen_length), device=device)
+            else:
+                raise NotImplementedError(remasking)
+
+            # Restrict unmasking to the current block.
+            x0_p[:, blk_hi:] = -np.inf
+            x0_p[:, :blk_lo] = -np.inf
+
+            keep = torch.where(mask_index, x0, resp)
+            confidence = torch.where(mask_index, x0_p,
+                                     torch.full_like(x0_p, -np.inf))
+
+            transfer = torch.zeros_like(x0, dtype=torch.bool)
+            k = int(num_transfer[0, i].item())
+            if k > 0:
+                _, sel = torch.topk(confidence[0], k=k)
+                transfer[0, sel] = True
+
+            # Apply the SAME unmask to every expert's response region so they
+            # stay in lock-step (shared response, different conditioning).
+            new_resp = resp.clone()
+            new_resp[transfer] = keep[transfer]
+            for e, x in enumerate(canvases):
+                x[:, _resp_slice(e)] = new_resp
+
+    # All experts share the response; return it from expert 0.
+    return canvases[0][:, _resp_slice(0)]
+
+
+# ---------------------------------------------------------------------------
 # Config dataclass
 # ---------------------------------------------------------------------------
 
@@ -487,3 +614,63 @@ class LLaDARewriter(PromptRewriter):
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         logger.info("LLaDA model unloaded.")
+
+    # ------------------------------------------------------------------
+    # Product-of-Experts composition (RQ5 capstone)
+    # ------------------------------------------------------------------
+
+    def compose(self, constraints: list[str]) -> str:
+        """
+        Compose multiple constraints into ONE refined description via joint
+        masked-diffusion denoising (product of experts).
+
+        Each constraint becomes an "expert" conditioning the same shared
+        response canvas; tokens are unmasked only where the experts jointly
+        agree. This is the capability AR structurally lacks — it cannot hold
+        N constraints in superposition and resolve them jointly.
+
+        Parameters
+        ----------
+        constraints:
+            List of constraint strings, e.g.
+            ["a red cat", "a blue dog", "the cat is left of the dog"].
+
+        Returns
+        -------
+        str
+            A single composed description satisfying all constraints jointly.
+        """
+        self._load()
+        cfg = self.config
+
+        # Each constraint gets the expansion instruction as its expert prefix,
+        # so every expert is "describe an image where <constraint>".
+        expert_prefixes = []
+        for c in constraints:
+            msg = [{"role": "user",
+                    "content": cfg.expansion_instruction.format(prompt=c)}]
+            formatted = self._tokenizer.apply_chat_template(
+                msg, add_generation_prompt=True, tokenize=False)
+            ids = self._tokenizer(formatted, add_special_tokens=False,
+                                  return_tensors="pt")["input_ids"]
+            expert_prefixes.append(ids)
+
+        _t0 = time.perf_counter()
+        resp_ids = _generate_poe(
+            model=self._model,
+            expert_prompts=expert_prefixes,
+            gen_length=cfg.gen_length,
+            steps=cfg.steps,
+            block_length=cfg.block_length,
+            temperature=cfg.temperature,
+            remasking=cfg.remasking,
+            device=cfg.device,
+        )
+        if cfg.device == "cuda":
+            torch.cuda.synchronize()
+        self.timing.record(time.perf_counter() - _t0)
+
+        composed = self._tokenizer.batch_decode(
+            resp_ids, skip_special_tokens=True)[0].strip()
+        logger.debug("LLaDA PoE composed %r -> %r", constraints, composed)
+        return composed

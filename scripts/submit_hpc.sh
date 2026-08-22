@@ -58,6 +58,8 @@ MEM_RQ1="4G"            # CLIP encoding only, all rewrites are cache hits
 MEM_RQ2="16G"           # two-phase: SD 2.1 then BLIP-2, never simultaneous
 MEM_RQ3="8G"            # CFG sweep, no BLIP-2
 MEM_RQ4="16G"           # same two-phase scorer stack as RQ2
+MEM_RQ5="20G"           # PoE: LLaDA + SD + BLIP-2 (small subset)
+MEM_RQ6="16G"           # tunability: LLaDA + SD + CLIPScore, no BLIP-2
 
 TIME_WARMUP_AR="04:00:00"   # AR warmup: ~442 Ollama calls, sequential
 TIME_WARMUP_LLADA="12:00:00" # LLaDA warmup: ~442 × 128-step masked diffusion passes
@@ -65,6 +67,8 @@ TIME_RQ1="01:00:00"         # RQ1: text + embeddings, all cache hits → fast
 TIME_RQ2="12:00:00"         # RQ2: image gen (50 steps × 500 prompts) + BLIP-2 scoring
 TIME_RQ3="06:00:00"         # RQ3: CFG sweep over 25 prompts × 5 scales
 TIME_RQ4="08:00:00"         # RQ4: AR vs LLaDA head-to-head
+TIME_RQ5="06:00:00"         # RQ5: PoE capstone, ~15-20 prompts x 4 conditions
+TIME_RQ6="12:00:00"         # RQ6: 256-cell tunability grid x 15 prompts
 
 # ---------------------------------------------------------------------------
 # Backbone-aware resource sizing.
@@ -92,13 +96,17 @@ mkdir -p "$LOG_DIR"
 # ---------------------------------------------------------------------------
 # Parse arguments
 # ---------------------------------------------------------------------------
-SUBMIT_RQS=("1" "2" "3" "4")
+SUBMIT_RQS=("1" "2" "3" "4" "5" "6")
 DRY_RUN=false
+# Backbones to run in the SAME chain, in order. Each backbone runs the full
+# RQ sequence writing to outputs/<backbone>/. Override with --backbones.
+BACKBONES=("sd21" "sdxl")
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --rq)      SUBMIT_RQS=("$2"); shift 2 ;;
-        --dry-run) DRY_RUN=true; shift ;;
+        --rq)        SUBMIT_RQS=("$2"); shift 2 ;;
+        --backbones) IFS=',' read -ra BACKBONES <<< "$2"; shift 2 ;;
+        --dry-run)   DRY_RUN=true; shift ;;
         *) echo "Unknown argument: $1"; exit 1 ;;
     esac
 done
@@ -199,34 +207,42 @@ nvidia-smi
 #   RQ1-3: each pipeline is independent, run them as separate processes
 #          (lets a single failure not kill the others; summaries merge via
 #           per-pipeline JSON sidecars).
-#   RQ4:   compares AR vs LLaDA HEAD-TO-HEAD, so both mechanisms must be in
-#          ONE process. Running it per-pipeline leaves one mechanism empty
-#          and the deltas uncomputable. Run it once with no --pipeline filter.
-if [[ "$RQ" == "4" ]]; then
+#   RQ4-6: run once in ONE process (RQ4 = mechanism comparison needs both AR+
+#          LLaDA; RQ5 = PoE builds its own 4 conditions; RQ6 = tunability grid).
+#
+# BACKBONE (env var, default sd21) selects the T2I backbone. We override the
+# config's t2i.backbone at runtime via --config so parallel backbone chains
+# don't race on the yaml file. run_experiment.py scopes output to
+# outputs/<backbone>/ automatically.
+BACKBONE="${BACKBONE:-sd21}"
+echo "Backbone: $BACKBONE"
+BACKBONE_OVERRIDE="t2i.backbone=${BACKBONE}"
+
+if [[ "$RQ" == "4" || "$RQ" == "5" || "$RQ" == "6" ]]; then
     echo ""
-    echo "--- RQ4: all pipelines in one process (mechanism comparison) ---"
+    echo "--- RQ${RQ}: single-process run (backbone=$BACKBONE) ---"
     python experiments/run_experiment.py \
-        --rq 4 \
-        --seed "${SEED:-42}"
+        --rq "$RQ" \
+        --seed "${SEED:-42}" \
+        --config "$BACKBONE_OVERRIDE"
 else
     PIPELINE_NAMES=("raw_clip" "ar_clip" "llada_clip")
     for PIPELINE_NAME in "${PIPELINE_NAMES[@]}"; do
         echo ""
-        echo "--- Pipeline: $PIPELINE_NAME ---"
+        echo "--- Pipeline: $PIPELINE_NAME (backbone=$BACKBONE) ---"
         python experiments/run_experiment.py \
             --rq "$RQ" \
             --pipeline "$PIPELINE_NAME" \
-            --seed "${SEED:-42}"
+            --seed "${SEED:-42}" \
+            --config "$BACKBONE_OVERRIDE"
     done
 fi
-echo "All pipelines complete for RQ${RQ}."
+echo "All pipelines complete for RQ${RQ} (backbone=$BACKBONE)."
 
-# Regenerate all plots from disk artifacts (traces + per-pipeline sidecars).
-# Idempotent and cheap — reads whatever exists so far, so running it after
-# every RQ progressively fills in figures. Never fails the job on plot errors.
+# Regenerate all plots from disk artifacts, scoped to this backbone's outputs.
 echo ""
-echo "--- Regenerating plots ---"
-python -m evaluation.plotting outputs || echo "WARN: plotting step failed (non-fatal)."
+echo "--- Regenerating plots (outputs/${BACKBONE}) ---"
+python -m evaluation.plotting "outputs/${BACKBONE}" || echo "WARN: plotting step failed (non-fatal)."
 TASK_EOF
 chmod +x "$TASK_SCRIPT"
 
@@ -452,51 +468,106 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Step 1-4: Submit RQ jobs sequentially chained (one job per RQ)
-# Each RQ waits for the previous one to finish before starting.
-# Pipelines run sequentially inside each job — no arrays.
+# Step 1-6: Submit RQ jobs, looped over BACKBONES.
+# Each backbone runs the full RQ sequence writing to outputs/<backbone>/.
+# The chain is: warmup -> [sd21 RQ1..6] -> [sdxl RQ1..6], each RQ waiting on
+# the previous. Backbones run sequentially (sdxl starts after sd21's last RQ)
+# so they never contend for the same GPU or race on outputs.
 # ---------------------------------------------------------------------------
 declare -A RQ_JOB_IDS
-PREV_DEPENDENCY="$DEPENDENCY"   # first RQ depends on warmup; subsequent RQs chain off each other
+PREV_DEPENDENCY="$DEPENDENCY"   # first job depends on warmup; rest chain
 
-for RQ in "${SUBMIT_RQS[@]}"; do
-    case "$RQ" in
-        1) TIME_LIMIT=$TIME_RQ1; MEM_LIMIT=$MEM_RQ1 ;;
-        2) TIME_LIMIT=$TIME_RQ2; MEM_LIMIT=$MEM_RQ2 ;;
-        3) TIME_LIMIT=$TIME_RQ3; MEM_LIMIT=$MEM_RQ3 ;;
-        4) TIME_LIMIT=$TIME_RQ4; MEM_LIMIT=$MEM_RQ4 ;;
-        *) echo "Unknown RQ: $RQ"; exit 1 ;;
-    esac
-
+for BACKBONE in "${BACKBONES[@]}"; do
     echo ""
-    echo "=== RQ${RQ} (pipelines: ${PIPELINE_NAMES[*]}, sequential) ==="
+    echo "############################################################"
+    echo "#  Backbone: ${BACKBONE}"
+    echo "############################################################"
 
-    DEP_ARG=""
-    [[ -n "$PREV_DEPENDENCY" ]] && DEP_ARG="--dependency=${PREV_DEPENDENCY}"
+    for RQ in "${SUBMIT_RQS[@]}"; do
+        case "$RQ" in
+            1) TIME_LIMIT=$TIME_RQ1; MEM_LIMIT=$MEM_RQ1 ;;
+            2) TIME_LIMIT=$TIME_RQ2; MEM_LIMIT=$MEM_RQ2 ;;
+            3) TIME_LIMIT=$TIME_RQ3; MEM_LIMIT=$MEM_RQ3 ;;
+            4) TIME_LIMIT=$TIME_RQ4; MEM_LIMIT=$MEM_RQ4 ;;
+            5) TIME_LIMIT=$TIME_RQ5; MEM_LIMIT=$MEM_RQ5 ;;
+            6) TIME_LIMIT=$TIME_RQ6; MEM_LIMIT=$MEM_RQ6 ;;
+            *) echo "Unknown RQ: $RQ"; exit 1 ;;
+        esac
 
-    JOB_ID=$(_sbatch \
-        $(_node_args) \
-        --mem="${MEM_LIMIT}" \
-        --time="${TIME_LIMIT}" \
-        --job-name="prompt-rq${RQ}" \
-        ${DEP_ARG:+"$DEP_ARG"} \
-        --output="${LOG_DIR}/rq${RQ}_%j.out" \
-        --error="${LOG_DIR}/rq${RQ}_%j.err" \
-        --export=ALL,RQ="${RQ}",SEED=42,WANDB_PROJECT=prompt-pipeline \
-        "$TASK_SCRIPT")
+        # SDXL is slower/heavier — raise limits for the generation-heavy RQs.
+        if [[ "$BACKBONE" == "sdxl" ]]; then
+            case "$RQ" in
+                2) TIME_LIMIT="24:00:00"; MEM_LIMIT="24G" ;;
+                3) TIME_LIMIT="12:00:00"; MEM_LIMIT="12G" ;;
+                4) TIME_LIMIT="18:00:00"; MEM_LIMIT="24G" ;;
+                5) TIME_LIMIT="08:00:00"; MEM_LIMIT="24G" ;;
+                6) TIME_LIMIT="24:00:00"; MEM_LIMIT="24G" ;;
+            esac
+        fi
 
-    RQ_JOB_IDS[$RQ]="$JOB_ID"
-    [[ -n "$PREV_DEPENDENCY" ]] \
-        && echo "  Job ID: $JOB_ID  (depends on: $PREV_DEPENDENCY)" \
-        || echo "  Job ID: $JOB_ID  (no dependency — starts immediately)"
+        echo ""
+        echo "=== [${BACKBONE}] RQ${RQ} ==="
 
-    # Next RQ chains off this one
-    if $DRY_RUN; then
-        PREV_DEPENDENCY="afterok:RQ${RQ}_JOB_ID"
-    else
-        PREV_DEPENDENCY="afterok:${JOB_ID}"
-    fi
+        DEP_ARG=""
+        [[ -n "$PREV_DEPENDENCY" ]] && DEP_ARG="--dependency=${PREV_DEPENDENCY}"
+
+        JOB_ID=$(_sbatch \
+            $(_node_args) \
+            --mem="${MEM_LIMIT}" \
+            --time="${TIME_LIMIT}" \
+            --job-name="prompt-${BACKBONE}-rq${RQ}" \
+            ${DEP_ARG:+"$DEP_ARG"} \
+            --output="${LOG_DIR}/${BACKBONE}_rq${RQ}_%j.out" \
+            --error="${LOG_DIR}/${BACKBONE}_rq${RQ}_%j.err" \
+            --export=ALL,RQ="${RQ}",BACKBONE="${BACKBONE}",SEED=42,WANDB_PROJECT=prompt-pipeline \
+            "$TASK_SCRIPT")
+
+        RQ_JOB_IDS["${BACKBONE}_${RQ}"]="$JOB_ID"
+        [[ -n "$PREV_DEPENDENCY" ]] \
+            && echo "  Job ID: $JOB_ID  (depends on: $PREV_DEPENDENCY)" \
+            || echo "  Job ID: $JOB_ID  (starts immediately)"
+
+        if $DRY_RUN; then
+            PREV_DEPENDENCY="afterok:${BACKBONE}_RQ${RQ}_JOB_ID"
+        else
+            PREV_DEPENDENCY="afterok:${JOB_ID}"
+        fi
+    done
 done
+
+# ---------------------------------------------------------------------------
+# Final step: cross-backbone comparison plots (reads outputs/sd21 + outputs/sdxl)
+# Chained after the very last RQ job so both backbones are complete.
+# ---------------------------------------------------------------------------
+COMPARE_SCRIPT="$REPO_ROOT/scripts/_slurm_compare.sh"
+cat > "$COMPARE_SCRIPT" << 'COMPARE_EOF'
+#!/bin/bash
+set -euo pipefail
+CONDA_ENV="prompt-pipeline"
+REPO_ROOT="${SLURM_SUBMIT_DIR:?}"
+cd "$REPO_ROOT"
+source ~/.bashrc
+conda activate "$CONDA_ENV"
+export LANG=C.UTF-8 LC_ALL=C.UTF-8 PYTHONIOENCODING=utf-8
+echo "--- Cross-backbone comparison (sd21 vs sdxl) ---"
+python -m evaluation.backbone_compare outputs || echo "WARN: comparison failed (non-fatal)."
+COMPARE_EOF
+chmod +x "$COMPARE_SCRIPT"
+
+echo ""
+echo "=== Cross-backbone comparison ==="
+COMPARE_DEP=""
+[[ -n "$PREV_DEPENDENCY" ]] && COMPARE_DEP="--dependency=${PREV_DEPENDENCY}"
+COMPARE_ID=$(_sbatch \
+    $(_node_args) \
+    --mem="4G" \
+    --time="00:30:00" \
+    --job-name="prompt-compare" \
+    ${COMPARE_DEP:+"$COMPARE_DEP"} \
+    --output="${LOG_DIR}/compare_%j.out" \
+    --error="${LOG_DIR}/compare_%j.err" \
+    "$COMPARE_SCRIPT")
+echo "  Job ID: $COMPARE_ID"
 
 # ---------------------------------------------------------------------------
 # Summary
@@ -505,9 +576,12 @@ echo ""
 echo "============================================================"
 echo "  Warmup AR    : ${WARMUP_AR_ID}"
 echo "  Warmup LLaDA : ${WARMUP_LLADA_ID}"
-for RQ in "${SUBMIT_RQS[@]}"; do
-    echo "  RQ${RQ}          : ${RQ_JOB_IDS[$RQ]:-n/a}"
+for BACKBONE in "${BACKBONES[@]}"; do
+    for RQ in "${SUBMIT_RQS[@]}"; do
+        echo "  [${BACKBONE}] RQ${RQ}    : ${RQ_JOB_IDS[${BACKBONE}_${RQ}]:-n/a}"
+    done
 done
+echo "  Compare      : ${COMPARE_ID:-n/a}"
 echo ""
 echo "  Monitor:"
 echo "    squeue -u \$USER"
@@ -517,9 +591,12 @@ echo ""
 echo "  Cancel all submitted jobs:"
 if ! $DRY_RUN; then
     ALL_IDS="${WARMUP_AR_ID} ${WARMUP_LLADA_ID}"
-    for RQ in "${SUBMIT_RQS[@]}"; do
-        ALL_IDS+=" ${RQ_JOB_IDS[$RQ]:-}"
+    for BACKBONE in "${BACKBONES[@]}"; do
+        for RQ in "${SUBMIT_RQS[@]}"; do
+            ALL_IDS+=" ${RQ_JOB_IDS[${BACKBONE}_${RQ}]:-}"
+        done
     done
+    ALL_IDS+=" ${COMPARE_ID:-}"
     echo "    scancel ${ALL_IDS}"
 fi
 echo "============================================================"

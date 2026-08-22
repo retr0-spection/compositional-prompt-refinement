@@ -762,6 +762,74 @@ def plot_cfg_stability(stab_dir: Path, out_dir: Path) -> None:
     _save(fig, out_dir, "cfg_stability")
 
 
+def plot_tunability_heatmaps(rq6_dir: Path, out_dir: Path) -> None:
+    """
+    RQ6 tunability: heatmaps over the 16x16 (LLaDA x image) config grid for
+    quality (CLIPScore), total time, and generation time. Reads
+    outputs/<backbone>/rq6/grid.jsonl.
+
+    Axes: rows = LLaDA config index (steps x gen_length),
+          cols = image config index (num_inference_steps x cfg_scale).
+    The SHAPE of the surface is the result — which region is fast/good, and
+    how steerable each axis is (steepness of the gradient).
+    """
+    plt = _style()
+    grid_path = Path(rq6_dir) / "grid.jsonl"
+    if not grid_path.exists():
+        logger.info("No %s — skipping tunability heatmaps.", grid_path)
+        return
+    import numpy as np
+
+    rows = []
+    for line in grid_path.read_text(encoding="utf-8").splitlines():
+        if line.strip():
+            rows.append(json.loads(line))
+    if not rows:
+        return
+
+    n_l = max(r["llada_idx"] for r in rows) + 1
+    n_i = max(r["image_idx"] for r in rows) + 1
+
+    def _grid(key):
+        g = np.full((n_l, n_i), np.nan)
+        for r in rows:
+            g[r["llada_idx"], r["image_idx"]] = r.get(key, np.nan)
+        return g
+
+    panels = [
+        ("mean_clip_score", "CLIPScore (quality)", "viridis"),
+        ("total_time", "Total time (s/prompt)", "magma_r"),
+        ("mean_gen_time", "Image gen time (s/prompt)", "magma_r"),
+    ]
+    fig, axes = plt.subplots(1, len(panels), figsize=(5 * len(panels), 4.6))
+    if len(panels) == 1:
+        axes = [axes]
+
+    for ax, (key, title, cmap) in zip(axes, panels):
+        g = _grid(key)
+        im = ax.imshow(g, aspect="auto", cmap=cmap, origin="lower")
+        ax.set_title(title, fontsize=10)
+        ax.set_xlabel("image config idx\n(steps x cfg)")
+        ax.set_ylabel("LLaDA config idx\n(steps x gen_length)")
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+    # Annotate with steerability if available.
+    stab_path = Path(rq6_dir) / "steerability.json"
+    subtitle = ""
+    if stab_path.exists():
+        try:
+            s = json.loads(stab_path.read_text(encoding="utf-8"))
+            subtitle = (f"steerability: image-axis={s['image_axis_steerability']:.4f}, "
+                        f"LLaDA-axis={s['llada_axis_steerability']:.4f} "
+                        f"(mean |ΔCLIP| between adjacent cells)")
+        except Exception:
+            pass
+    fig.suptitle("RQ6 — tunability surface" + (f"\n{subtitle}" if subtitle else ""),
+                 fontsize=11)
+    fig.tight_layout(rect=[0, 0, 1, 0.94])
+    _save(fig, out_dir, "rq6_tunability")
+
+
 def generate_all_plots(
     output_root: str | Path = "outputs",
     rq3_results: Optional[dict] = None,
@@ -810,6 +878,9 @@ def generate_all_plots(
 
     # CFG-stability across denoising steps (diagnostic).
     plot_cfg_stability(root / "cfg_stability", plot_dir)
+
+    # RQ6 tunability heatmaps (if the sweep ran).
+    plot_tunability_heatmaps(root / "rq6", plot_dir)
 
     logger.info("Plotting complete. Figures in %s", plot_dir)
 
