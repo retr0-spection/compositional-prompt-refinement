@@ -54,12 +54,21 @@ def load_config(overrides: list[str] | None = None) -> dict:
     if overrides:
         for override in overrides:
             key, _, val = override.partition("=")
-            # Try to parse as Python literal; fall back to string
+            # Parse value as a Python literal; fall back to string.
             try:
                 import ast
-                cfg[key] = ast.literal_eval(val)
+                parsed = ast.literal_eval(val)
             except (ValueError, SyntaxError):
-                cfg[key] = val
+                parsed = val
+            # Support dotted keys for nested config, e.g. t2i.backbone=sdxl.
+            if "." in key:
+                head, _, tail = key.partition(".")
+                cfg.setdefault(head, {})
+                if not isinstance(cfg[head], dict):
+                    cfg[head] = {}
+                cfg[head][tail] = parsed
+            else:
+                cfg[key] = parsed
     return cfg
 
 
@@ -278,8 +287,11 @@ def load_fid_reference(cfg: dict) -> list | None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run prompt pipeline experiments")
-    parser.add_argument("--rq", required=True, choices=["0", "1", "2", "3", "4", "all"],
-                        help="Which RQ to run. 0 = warm the rewrite cache only (run before HPC jobs)")
+    parser.add_argument("--rq", required=True,
+                        choices=["0", "1", "2", "3", "4", "5", "6", "all"],
+                        help="Which RQ to run. 0 = warm rewrite cache; "
+                             "5 = PoE (language-side product-of-experts); "
+                             "6 = tunability sweep")
     parser.add_argument("--seed", type=int, default=None,
                         help="Override seed (default: first seed in config)")
     parser.add_argument("--cfg", type=float, default=None,
@@ -323,7 +335,13 @@ def main() -> None:
         )
 
     from utils.prompt_io import load_prompts
-    output_dir = Path(cfg.get("output_dir", "outputs"))
+
+    # Backbone-scoped output root: outputs/<backbone>/... so SD 2.1 and SDXL
+    # runs coexist and can be compared. Backbone comes from the t2i: block
+    # (T2IRunnerV2); legacy flat config defaults to 'sd21'.
+    backbone = cfg.get("t2i", {}).get("backbone", "sd21")
+    output_dir = Path(cfg.get("output_dir", "outputs")) / backbone
+    logger.info("Output root (backbone-scoped): %s", output_dir)
 
     def _filter_pipelines(pipelines: list) -> list:
         """Keep only the requested pipeline when --pipeline is specified."""
@@ -369,6 +387,7 @@ def main() -> None:
 
         pipelines = _filter_pipelines(build_pipelines(cfg, dry_run=False))
 
+        timing_summaries = {}
         for pipeline in pipelines:
             if isinstance(pipeline, RawPipeline):
                 logger.info("Skipping %s — no rewriter to cache.", pipeline.name)
@@ -380,6 +399,40 @@ def main() -> None:
             pipeline.encode_batch(all_prompts)
             logger.info("Cache warm for %s.", pipeline.name)
 
+            # Collect language-layer inference timing (AR vs LLaDA wall-clock).
+            # The rewriter accumulated per-rewrite seconds during encode_batch;
+            # only REAL inference is counted (cache hits excluded). If every
+            # prompt was already cached, n=0 and we skip.
+            rewriter = getattr(pipeline, "_rewriter", None)
+            timing = getattr(rewriter, "timing", None)
+            if timing is not None and timing.n > 0:
+                summ = timing.summary()
+                timing_summaries[pipeline.name] = summ
+                logger.info(
+                    "[timing] %s: %d rewrites | mean %.3fs | median %.3fs | total %.1fs",
+                    pipeline.name, summ["n"], summ["mean_seconds"],
+                    summ["median_seconds"], summ["total_seconds"],
+                )
+
+        # Persist timing so it survives the warmup job and can be plotted /
+        # compared across mechanisms. Merges with any existing file so AR and
+        # LLaDA warmups (separate SLURM jobs) both land in one place.
+        if timing_summaries:
+            import json
+            timing_path = output_dir / "rewrite_timing.json"
+            timing_path.parent.mkdir(parents=True, exist_ok=True)
+            existing = {}
+            if timing_path.exists():
+                try:
+                    with open(timing_path, encoding="utf-8") as f:
+                        existing = json.load(f)
+                except (json.JSONDecodeError, OSError):
+                    pass
+            existing.update(timing_summaries)
+            with open(timing_path, "w", encoding="utf-8") as f:
+                json.dump(existing, f, indent=2)
+            logger.info("Rewrite timing written to %s", timing_path)
+
         logger.info("Rewrite cache complete. Exiting.")
         if wandb_log:
             from utils.logging import finish
@@ -388,7 +441,7 @@ def main() -> None:
 
     # ------------------------------------------------------------------
 
-    rqs_to_run = ["1", "2", "3", "4"] if args.rq == "all" else [args.rq]
+    rqs_to_run = ["1", "2", "3", "4", "5", "6"] if args.rq == "all" else [args.rq]
 
     for rq in rqs_to_run:
         logger.info("=" * 60)
@@ -464,6 +517,82 @@ def main() -> None:
                 clip_scorer=clip_scorer, attr_scorer=attr_scorer, rel_scorer=rel_scorer,
                 seed=seed, cfg_scale=cfg_scale,
                 output_dir=output_dir / "rq4", wandb_log=wandb_log,
+            )
+
+        elif rq == "5":
+            # RQ5: language-side PoE capstone. Needs the AR + LLaDA rewriters,
+            # the scene-graph extractor (for constraint decomposition), and the
+            # text-in runner. Small compositional subset.
+            from experiments.rq5_poe import run_rq5
+            from rewriters.ollama_rewriter import OllamaRewriter, OllamaRewriterConfig
+            from rewriters.llada_rewriter import LLaDARewriter, LLaDARewriterConfig
+            from evaluation.embedding_analysis import SemanticExtractor
+
+            runner = build_runner(cfg, dry_run)
+            clip_scorer, _, attr_scorer, rel_scorer = build_scorers(cfg, dry_run)
+
+            cache_dir = cfg.get("rewrite_cache_dir")
+            ar_cache = str(Path(cache_dir) / f"ar_{cfg.get('ollama_model', 'llama3.1')}.json") if cache_dir else None
+            ar_rw = OllamaRewriter(OllamaRewriterConfig(
+                model=cfg.get("ollama_model", "llama3.1"),
+                base_url=cfg.get("ollama_base_url", "http://localhost:11434"),
+                timeout=cfg.get("ollama_timeout", 600), cache_path=ar_cache,
+            ))
+            llada_raw = cfg.get("llada", {})
+            llada_rw = LLaDARewriter(LLaDARewriterConfig(
+                model_id=cfg.get("llada_model", "GSAI-ML/LLaDA-8B-Instruct"),
+                device="cuda" if torch.cuda.is_available() else "cpu",
+                gen_length=llada_raw.get("gen_length", 128),
+                steps=llada_raw.get("steps", 128),
+                block_length=llada_raw.get("block_length", 32),
+                cache_path=str(Path(cache_dir) / "llada.json") if cache_dir else None,
+            ))
+            extractor = SemanticExtractor(
+                use_llm=True,
+                model=cfg.get("ollama_model", "llama3.1"),
+                base_url=cfg.get("ollama_base_url", "http://localhost:11434"),
+            )
+            # Small compositional subset for the proof of concept.
+            poe_set = cfg.get("eval_prompt_sets", {}).get("rq5", ["rq5_compositional"])
+            prompts = []
+            for s in poe_set:
+                prompts.extend(load_prompts(s))
+            if dry_run:
+                prompts = prompts[:3]
+            run_rq5(
+                prompts=prompts, ar_rewriter=ar_rw, llada_rewriter=llada_rw,
+                extractor=extractor, runner=runner,
+                clip_scorer=clip_scorer, attr_scorer=attr_scorer, rel_scorer=rel_scorer,
+                seed=seed, cfg_scale=cfg_scale,
+                output_dir=output_dir / "rq5", wandb_log=wandb_log,
+            )
+
+        elif rq == "6":
+            # RQ6: tunability sweep (256-cell grid). Needs LLaDA rewriter and
+            # the text-in runner; CLIPScore only (256 cells x subset).
+            from experiments.tunability import run_tunability
+            from rewriters.llada_rewriter import LLaDARewriter, LLaDARewriterConfig
+
+            runner = build_runner(cfg, dry_run)
+            clip_scorer, _, _, _ = build_scorers(cfg, dry_run)
+            cache_dir = cfg.get("rewrite_cache_dir")
+            llada_raw = cfg.get("llada", {})
+            llada_rw = LLaDARewriter(LLaDARewriterConfig(
+                model_id=cfg.get("llada_model", "GSAI-ML/LLaDA-8B-Instruct"),
+                device="cuda" if torch.cuda.is_available() else "cpu",
+                block_length=llada_raw.get("block_length", 32),
+                cache_path=None,  # RQ6 sweeps configs; disk cache would collide
+            ))
+            sweep_set = cfg.get("eval_prompt_sets", {}).get("rq6", ["rq6_tunability"])
+            prompts = []
+            for s in sweep_set:
+                prompts.extend(load_prompts(s))
+            prompts = prompts[:3] if dry_run else prompts[:15]
+            run_tunability(
+                prompts=prompts, llada_rewriter=llada_rw, runner=runner,
+                clip_scorer=clip_scorer, seed=seed,
+                output_dir=output_dir / "rq6", wandb_log=wandb_log,
+                n_axis=2 if dry_run else 16,
             )
 
     if wandb_log:

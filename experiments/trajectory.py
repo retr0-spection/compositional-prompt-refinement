@@ -84,16 +84,26 @@ def run_trajectory(
 
             enc_results = pipeline.encode_batch(prompts)
             records: list[dict] = []
+            _v2 = hasattr(runner, "_encode")
 
             for idx, (prompt, enc) in enumerate(zip(prompts, enc_results)):
-                _, trajectory = runner.generate_with_trajectory(
-                    prompt_embeds=enc.embedding,
-                    prompt_text=enc.raw_prompt,   # score vs. user intent
-                    clip_scorer=clip_scorer,
-                    cfg_scale=cfg_scale,
-                    seed=seed,
-                    score_every=score_every,
-                )
+                if _v2:  # text-in runner
+                    _, trajectory = runner.generate_with_trajectory(
+                        prompt_text=enc.rewritten_prompt,
+                        clip_scorer=clip_scorer,
+                        cfg_scale=cfg_scale,
+                        seed=seed,
+                        score_every=score_every,
+                    )
+                else:  # legacy embedding-in runner
+                    _, trajectory = runner.generate_with_trajectory(
+                        prompt_embeds=enc.embedding,
+                        prompt_text=enc.raw_prompt,
+                        clip_scorer=clip_scorer,
+                        cfg_scale=cfg_scale,
+                        seed=seed,
+                        score_every=score_every,
+                    )
                 for point in trajectory:
                     records.append({
                         "idx": idx,

@@ -643,6 +643,193 @@ def plot_rq4_deltas(rq4_dir: Path, out_dir: Path) -> None:
     _save(fig, out_dir, "rq4_mechanism_deltas")
 
 
+def plot_rewrite_timing(output_root: Path, out_dir: Path) -> None:
+    """
+    Language-layer inference time: AR vs LLaDA wall-clock per rewrite.
+
+    Reads outputs/rewrite_timing.json (written by the RQ0 warmup). Two bars
+    per mechanism: mean and median seconds per rewrite. This is the concrete
+    mechanism-cost tradeoff — if LLaDA costs Nx the AR wall-clock for
+    comparable quality, that N is a first-class finding.
+    """
+    plt = _style()
+    timing_path = Path(output_root) / "rewrite_timing.json"
+    if not timing_path.exists():
+        logger.info("No %s — skipping rewrite-timing plot.", timing_path)
+        return
+    try:
+        data = json.loads(timing_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        logger.warning("Could not read rewrite timing (%s)", exc)
+        return
+    if not data:
+        return
+
+    import numpy as np
+    # data: {pipeline_name: {mechanism, n, mean_seconds, median_seconds, ...}}
+    names = sorted(data.keys())
+    means = [data[n].get("mean_seconds", 0) for n in names]
+    medians = [data[n].get("median_seconds", 0) for n in names]
+    counts = [data[n].get("n", 0) for n in names]
+
+    x = np.arange(len(names))
+    w = 0.38
+    fig, ax = plt.subplots(figsize=(1.6 * len(names) + 3, 4.5))
+    ax.bar(x - w/2, means, w, label="mean", color="#7B5EA7")
+    ax.bar(x + w/2, medians, w, label="median", color="#4C9F70")
+
+    # Annotate with per-mechanism sample count and the LLaDA/AR ratio if both present.
+    for xi, (m, c) in enumerate(zip(means, counts)):
+        ax.annotate(f"n={c}", (xi, m), textcoords="offset points",
+                    xytext=(0, 4), ha="center", fontsize=8, color="#555")
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(names, rotation=15, ha="right")
+    ax.set_ylabel("Seconds per rewrite")
+    ax.set_title("Language-layer inference time (AR vs LLaDA)")
+    ax.legend(fontsize=9)
+
+    # If both an ar_* and llada_* pipeline are present, print the cost ratio.
+    ar = next((n for n in names if n.startswith("ar_")), None)
+    ll = next((n for n in names if n.startswith("llada_")), None)
+    if ar and ll and data[ar].get("mean_seconds"):
+        ratio = data[ll]["mean_seconds"] / data[ar]["mean_seconds"]
+        ax.text(0.98, 0.02, f"LLaDA / AR mean = {ratio:.1f}x",
+                transform=ax.transAxes, ha="right", va="bottom",
+                fontsize=9, color="#333",
+                bbox=dict(boxstyle="round", fc="#f4f0fa", ec="#7B5EA7", alpha=0.8))
+    _save(fig, out_dir, "rewrite_timing")
+
+
+def load_cfg_stability(stab_dir: Path) -> dict[str, dict]:
+    """
+    Return {pipeline: {cfg_scale(float): stability}} from cfg_stability runs.
+    Reads outputs/cfg_stability/<pipeline>/stability.json.
+    """
+    stab_dir = Path(stab_dir)
+    out: dict[str, dict] = {}
+    if not stab_dir.is_dir():
+        logger.info("No cfg_stability dir %s — skipping stability-vs-CFG plots.", stab_dir)
+        return out
+    for f in sorted(stab_dir.glob("*/stability.json")):
+        pipe = f.parent.name
+        try:
+            raw = json.loads(f.read_text(encoding="utf-8"))
+            out[pipe] = {float(k): v for k, v in raw.items()}
+        except Exception as exc:
+            logger.warning("Could not read %s (%s)", f, exc)
+    return out
+
+
+def plot_cfg_stability(stab_dir: Path, out_dir: Path) -> None:
+    """
+    Trajectory stability vs CFG scale, one line per pipeline (higher = the
+    denoising path stays smoother at that guidance strength).
+
+    Distinct from RQ3's compositional_stability (variance of FINAL quality
+    across scales): this measures step-to-step smoothness of the denoising
+    TRAJECTORY at each scale. NOTE: the underlying 1/(1+mean|Δ|) metric is an
+    ad-hoc smoothness proxy — read differences relatively, not absolutely.
+    """
+    plt = _style()
+    data = load_cfg_stability(stab_dir)
+    if not data:
+        return
+    import math
+
+    fig, ax = plt.subplots(figsize=(6.5, 4.5))
+    plotted = 0
+    for pipe in _PIPELINE_ORDER:
+        if pipe not in data:
+            continue
+        items = sorted(data[pipe].items())
+        pairs = [(s, v) for s, v in items
+                 if v is not None and not (isinstance(v, float) and math.isnan(v))]
+        if not pairs:
+            continue
+        xs, ys = zip(*pairs)
+        ax.plot(xs, ys, marker="o", label=pipe,
+                color=_PIPELINE_COLOURS.get(pipe, "#333"))
+        plotted += 1
+
+    if plotted == 0:
+        plt.close(fig)
+        return
+    ax.set_xlabel("CFG scale $w$")
+    ax.set_ylabel("Trajectory stability (higher = smoother path)")
+    ax.set_title("Denoising-trajectory stability vs. guidance scale")
+    ax.legend(fontsize=9)
+    _save(fig, out_dir, "cfg_stability")
+
+
+def plot_tunability_heatmaps(rq6_dir: Path, out_dir: Path) -> None:
+    """
+    RQ6 tunability: heatmaps over the 16x16 (LLaDA x image) config grid for
+    quality (CLIPScore), total time, and generation time. Reads
+    outputs/<backbone>/rq6/grid.jsonl.
+
+    Axes: rows = LLaDA config index (steps x gen_length),
+          cols = image config index (num_inference_steps x cfg_scale).
+    The SHAPE of the surface is the result — which region is fast/good, and
+    how steerable each axis is (steepness of the gradient).
+    """
+    plt = _style()
+    grid_path = Path(rq6_dir) / "grid.jsonl"
+    if not grid_path.exists():
+        logger.info("No %s — skipping tunability heatmaps.", grid_path)
+        return
+    import numpy as np
+
+    rows = []
+    for line in grid_path.read_text(encoding="utf-8").splitlines():
+        if line.strip():
+            rows.append(json.loads(line))
+    if not rows:
+        return
+
+    n_l = max(r["llada_idx"] for r in rows) + 1
+    n_i = max(r["image_idx"] for r in rows) + 1
+
+    def _grid(key):
+        g = np.full((n_l, n_i), np.nan)
+        for r in rows:
+            g[r["llada_idx"], r["image_idx"]] = r.get(key, np.nan)
+        return g
+
+    panels = [
+        ("mean_clip_score", "CLIPScore (quality)", "viridis"),
+        ("total_time", "Total time (s/prompt)", "magma_r"),
+        ("mean_gen_time", "Image gen time (s/prompt)", "magma_r"),
+    ]
+    fig, axes = plt.subplots(1, len(panels), figsize=(5 * len(panels), 4.6))
+    if len(panels) == 1:
+        axes = [axes]
+
+    for ax, (key, title, cmap) in zip(axes, panels):
+        g = _grid(key)
+        im = ax.imshow(g, aspect="auto", cmap=cmap, origin="lower")
+        ax.set_title(title, fontsize=10)
+        ax.set_xlabel("image config idx\n(steps x cfg)")
+        ax.set_ylabel("LLaDA config idx\n(steps x gen_length)")
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+    # Annotate with steerability if available.
+    stab_path = Path(rq6_dir) / "steerability.json"
+    subtitle = ""
+    if stab_path.exists():
+        try:
+            s = json.loads(stab_path.read_text(encoding="utf-8"))
+            subtitle = (f"steerability: image-axis={s['image_axis_steerability']:.4f}, "
+                        f"LLaDA-axis={s['llada_axis_steerability']:.4f} "
+                        f"(mean |ΔCLIP| between adjacent cells)")
+        except Exception:
+            pass
+    fig.suptitle("RQ6 — tunability surface" + (f"\n{subtitle}" if subtitle else ""),
+                 fontsize=11)
+    fig.tight_layout(rect=[0, 0, 1, 0.94])
+    _save(fig, out_dir, "rq6_tunability")
+
+
 def generate_all_plots(
     output_root: str | Path = "outputs",
     rq3_results: Optional[dict] = None,
@@ -685,6 +872,15 @@ def generate_all_plots(
     # Denoising trajectory — only if instrumented.
     for m in ("clip_score",):
         plot_trajectory(root / "trajectory", plot_dir, metric=m)
+
+    # Language-layer inference timing (AR vs LLaDA wall-clock).
+    plot_rewrite_timing(root, plot_dir)
+
+    # CFG-stability across denoising steps (diagnostic).
+    plot_cfg_stability(root / "cfg_stability", plot_dir)
+
+    # RQ6 tunability heatmaps (if the sweep ran).
+    plot_tunability_heatmaps(root / "rq6", plot_dir)
 
     logger.info("Plotting complete. Figures in %s", plot_dir)
 
