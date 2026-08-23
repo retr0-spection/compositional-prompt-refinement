@@ -93,15 +93,39 @@ class T2IRunnerV2Config:
         if isinstance(dtype, str):
             dtype = getattr(torch, dtype)
 
+        # Backbone-coupled fields (model_id, resolution, prediction_type) must
+        # be consistent with `backbone`. Only honour an explicit override of
+        # these if it is NOT the other backbone's committed default — otherwise
+        # a stale SDXL model_id in the yaml would load into an sd21 pipeline.
+        _other = "sdxl" if backbone == "sd21" else "sd21"
+        _other_defaults = {
+            "sd21": dict(model_id="sd2-community/stable-diffusion-2-1",
+                         resolution=768, prediction_type="v_prediction"),
+            "sdxl": dict(model_id="stabilityai/stable-diffusion-xl-base-1.0",
+                         resolution=1024, prediction_type="epsilon"),
+        }[_other]
+
+        def _coupled(key):
+            val = t2i.get(key, defaults[key])
+            # If the value matches the OTHER backbone's default, it's stale
+            # config left over from a backbone switch — use this backbone's.
+            if val == _other_defaults[key]:
+                logger.warning(
+                    "t2i.%s=%r matches the %s default but backbone=%s — "
+                    "using %s's default instead to avoid a mismatch.",
+                    key, val, _other, backbone, backbone)
+                return defaults[key]
+            return val
+
         return cls(
             backbone=backbone,
-            model_id=t2i.get("model_id", defaults["model_id"]),
+            model_id=_coupled("model_id"),
             device=t2i.get("device", "cuda"),
             torch_dtype=dtype,
             num_inference_steps=t2i.get("num_inference_steps", 50),
             default_cfg_scale=t2i.get("default_cfg_scale", 7.5),
-            resolution=t2i.get("resolution", defaults["resolution"]),
-            prediction_type=t2i.get("prediction_type", defaults["prediction_type"]),
+            resolution=_coupled("resolution"),
+            prediction_type=_coupled("prediction_type"),
             use_karras_sigmas=t2i.get("use_karras_sigmas", True),
         )
 

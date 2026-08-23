@@ -210,13 +210,23 @@ nvidia-smi
 #   RQ4-6: run once in ONE process (RQ4 = mechanism comparison needs both AR+
 #          LLaDA; RQ5 = PoE builds its own 4 conditions; RQ6 = tunability grid).
 #
-# BACKBONE (env var, default sd21) selects the T2I backbone. We override the
-# config's t2i.backbone at runtime via --config so parallel backbone chains
-# don't race on the yaml file. run_experiment.py scopes output to
+# BACKBONE (env var, default sd21) selects the T2I backbone. We override ALL
+# backbone-coupled config fields together (not just backbone) so the yaml's
+# committed SDXL model_id/resolution/prediction_type don't leak into an sd21
+# run — that mismatch loads SDXL weights into the SD2.1 pipeline and crashes
+# with 'added_cond_kwargs is None'. run_experiment.py scopes output to
 # outputs/<backbone>/ automatically.
 BACKBONE="${BACKBONE:-sd21}"
 echo "Backbone: $BACKBONE"
-BACKBONE_OVERRIDE="t2i.backbone=${BACKBONE}"
+if [[ "$BACKBONE" == "sdxl" ]]; then
+    BACKBONE_OVERRIDE=(--config t2i.backbone=sdxl
+                       t2i.model_id=stabilityai/stable-diffusion-xl-base-1.0
+                       t2i.resolution=1024 t2i.prediction_type=epsilon)
+else
+    BACKBONE_OVERRIDE=(--config t2i.backbone=sd21
+                       t2i.model_id=sd2-community/stable-diffusion-2-1
+                       t2i.resolution=768 t2i.prediction_type=v_prediction)
+fi
 
 if [[ "$RQ" == "4" || "$RQ" == "5" || "$RQ" == "6" ]]; then
     echo ""
@@ -224,7 +234,7 @@ if [[ "$RQ" == "4" || "$RQ" == "5" || "$RQ" == "6" ]]; then
     python experiments/run_experiment.py \
         --rq "$RQ" \
         --seed "${SEED:-42}" \
-        --config "$BACKBONE_OVERRIDE"
+        "${BACKBONE_OVERRIDE[@]}"
 else
     PIPELINE_NAMES=("raw_clip" "ar_clip" "llada_clip")
     for PIPELINE_NAME in "${PIPELINE_NAMES[@]}"; do
@@ -234,7 +244,7 @@ else
             --rq "$RQ" \
             --pipeline "$PIPELINE_NAME" \
             --seed "${SEED:-42}" \
-            --config "$BACKBONE_OVERRIDE"
+            "${BACKBONE_OVERRIDE[@]}"
     done
 fi
 echo "All pipelines complete for RQ${RQ} (backbone=$BACKBONE)."
