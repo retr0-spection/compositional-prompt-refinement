@@ -102,6 +102,8 @@ eval_prompt_sets:
   rq2: [color_binding, shape_binding, texture_binding, spatial_relations, non_spatial, cats_dogs]
   rq3: [rq3_sweep]   # 25-prompt representative sample, swept over cfg_scales
   rq4: [color_binding, spatial_relations, cats_dogs]
+  rq5: [rq5_compositional]   # hard compositional prompts for the PoE capstone
+  rq6: [rq6_tunability]      # fixed 15-prompt subset for the tunability sweep
 
 # ---------------------------------------------------------------------------
 # Paths
