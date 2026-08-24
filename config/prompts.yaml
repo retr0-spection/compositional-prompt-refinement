@@ -559,3 +559,49 @@ rq3_sweep:
   - "A woman is holding a yoga mat and heading to a class."
   - "The woodcarver is creating a sculpture of a bird from a block of wood."
   - "A cat is lazily lounging in a sunny windowsill."
+
+# rq5_compositional: HARD multi-constraint prompts for the PoE capstone (RQ5).
+# Each has >=2 objects, an attribute bound to each, AND a spatial relation —
+# the regime where joint composition (PoE) should help most, because a single
+# left-to-right AR pass must commit early tokens before resolving later
+# constraints. ~18 prompts (proof-of-concept scale).
+rq5_compositional:
+  - "a red cat on the left of a blue dog"
+  - "a green book above a yellow cup"
+  - "a small wooden chair beside a large metal table"
+  - "a black hat on top of a white box"
+  - "a round red apple next to a square green plate"
+  - "a tall glass bottle behind a short ceramic bowl"
+  - "a purple flower to the right of an orange vase"
+  - "a fluffy grey cat under a brown leather chair"
+  - "a blue bicycle to the left of a red car"
+  - "a golden clock above a silver key"
+  - "a striped shirt next to a spotted scarf"
+  - "a large brown bear behind a small white rabbit"
+  - "a triangular slice of cheese on a rectangular wooden board"
+  - "a green frog on top of a brown log beside a blue pond"
+  - "a red rose between a white candle and a black vase"
+  - "a cubic ice block inside a cylindrical glass"
+  - "a yellow duck on the right of a green frog in a brown pond"
+  - "a shiny metal spoon on the left of a matte plastic fork"
+
+# rq6_tunability: fixed 15-prompt subset for the tunability sweep (RQ6).
+# A spread across colour / shape / texture / spatial / compositional so the
+# tunability surface isn't specialised to one prompt type. Held constant
+# across all 256 grid cells.
+rq6_tunability:
+  - "a green bench and a blue bowl"
+  - "a brown horse and a blue vase"
+  - "a red apple and a yellow pear"
+  - "an oblong cucumber and a teardrop plum"
+  - "a cubic block and a cylindrical bottle"
+  - "a plastic toy and a glass bottle"
+  - "a metallic desk lamp and a fluffy sweater"
+  - "a giraffe next to a lamp"
+  - "a cat on the top of a sofa"
+  - "a bee on the right of a refrigerator"
+  - "a red cat on the left of a blue dog"
+  - "a small wooden chair beside a large metal table"
+  - "a green frog on top of a brown log beside a blue pond"
+  - "a black hat on top of a white box"
+  - "A person is looking at a rainbow and marveling at its beauty."
