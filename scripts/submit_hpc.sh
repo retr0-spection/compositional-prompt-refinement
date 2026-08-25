@@ -98,15 +98,17 @@ mkdir -p "$LOG_DIR"
 # ---------------------------------------------------------------------------
 SUBMIT_RQS=("1" "2" "3" "4" "5" "6")
 DRY_RUN=false
+FORCE_WARMUP=false
 # Backbones to run in the SAME chain, in order. Each backbone runs the full
 # RQ sequence writing to outputs/<backbone>/. Override with --backbones.
 BACKBONES=("sd21" "sdxl")
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --rq)        SUBMIT_RQS=("$2"); shift 2 ;;
-        --backbones) IFS=',' read -ra BACKBONES <<< "$2"; shift 2 ;;
-        --dry-run)   DRY_RUN=true; shift ;;
+        --rq)          SUBMIT_RQS=("$2"); shift 2 ;;
+        --backbones)   IFS=',' read -ra BACKBONES <<< "$2"; shift 2 ;;
+        --dry-run)     DRY_RUN=true; shift ;;
+        --force-warmup) FORCE_WARMUP=true; shift ;;
         *) echo "Unknown argument: $1"; exit 1 ;;
     esac
 done
@@ -439,13 +441,20 @@ CACHE_DIR="$REPO_ROOT/outputs/rewrite_cache"
 AR_CACHE="${CACHE_DIR}/ar_llama3.1.json"
 LLADA_CACHE="${CACHE_DIR}/llada.json"
 
-if [[ -f "$AR_CACHE" ]] && [[ -f "$LLADA_CACHE" ]]; then
+if [[ -f "$AR_CACHE" ]] && [[ -f "$LLADA_CACHE" ]] && ! $FORCE_WARMUP; then
     echo ""
     echo "=== Rewrite cache already populated — skipping warmup jobs ==="
+    echo "    (pass --force-warmup to re-run the warmup and top up the cache"
+    echo "     with any newly-added prompt sets; existing entries are kept)"
     WARMUP_AR_ID="(cached)"
     WARMUP_LLADA_ID="(cached)"
     DEPENDENCY=""
 else
+    if $FORCE_WARMUP && [[ -f "$AR_CACHE" ]]; then
+        echo ""
+        echo "=== --force-warmup: re-running warmup (existing cache entries are"
+        echo "    preserved; only prompts missing from the cache are computed) ==="
+    fi
     echo ""
     echo "=== Step 0a: AR rewrite warmup ==="
     WARMUP_AR_ID=$(_sbatch \
