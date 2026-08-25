@@ -92,11 +92,12 @@ def run_tunability(
         # configs don't collide (different configs must produce fresh rewrites).
         llada_rewriter.config.steps = lcfg["steps"]
         llada_rewriter.config.gen_length = lcfg["gen_length"]
-        # block_length must divide gen_length; clamp to a safe divisor.
-        bl = 32
-        while lcfg["gen_length"] % bl != 0 and bl > 1:
-            bl //= 2
-        llada_rewriter.config.block_length = bl
+        # LLaDA's _generate requires BOTH:
+        #   gen_length % block_length == 0   AND   steps % (gen_length//block_length) == 0
+        # Setting block_length = gen_length makes num_blocks = 1, which divides
+        # any steps value — sidestepping the semi-autoregressive blocking, which
+        # a tunability sweep over (steps, gen_length) doesn't need to vary.
+        llada_rewriter.config.block_length = lcfg["gen_length"]
         llada_rewriter._cache = {}  # force re-rewrite under this config
 
         # Rewrite the subset once for this LLaDA config (timed).
