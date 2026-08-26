@@ -62,15 +62,22 @@ def run_tunability(
     output_dir: str | Path = "outputs/rq6",
     wandb_log: bool = True,
     n_axis: int = 16,
+    showcase_idx: int = 0,
 ) -> dict:
     """
     Run the 256-cell tunability grid over a small fixed prompt subset.
 
     llada_rewriter : an LLaDARewriter whose config we mutate per LLaDA cell.
     runner         : T2IRunnerV2 (text-in); num_inference_steps/cfg passed per cell.
+    showcase_idx   : which prompt's image to SAVE per cell for the image-grid
+                     figure (default: first prompt). One image per cell is kept
+                     at rq6/grid_images/L{li}_I{ii}.png so a readable 4x4 slice
+                     can be laid out later without regenerating.
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    grid_img_dir = output_dir / "grid_images"
+    grid_img_dir.mkdir(parents=True, exist_ok=True)
     llada_axis, image_axis = _build_axes(n_axis)
 
     grid_path = output_dir / "grid.jsonl"
@@ -128,6 +135,13 @@ def run_tunability(
             clip_scores = [clip_scorer.score(img, p)
                            for img, p in zip(images, prompts)]
             mean_clip = sum(clip_scores) / len(clip_scores) if clip_scores else 0.0
+
+            # Save the showcase prompt's image for the image-grid figure.
+            if 0 <= showcase_idx < len(images):
+                try:
+                    images[showcase_idx].save(grid_img_dir / f"L{li}_I{ii}.png")
+                except Exception as exc:
+                    logger.debug("Could not save showcase image L%d_I%d (%s)", li, ii, exc)
 
             row = {
                 "llada_idx": li, "image_idx": ii,
