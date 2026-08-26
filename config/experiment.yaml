@@ -118,5 +118,5 @@ rewrite_cache_dir: outputs/rewrite_cache/
 # ---------------------------------------------------------------------------
 # Experiment tracking
 # ---------------------------------------------------------------------------
-wandb_project: Diffusion_Refinement
+wandb_project: diff_ref
 wandb_offline: false    # set true on HPC without internet
