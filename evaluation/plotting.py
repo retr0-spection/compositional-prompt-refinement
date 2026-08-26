@@ -830,6 +830,214 @@ def plot_tunability_heatmaps(rq6_dir: Path, out_dir: Path) -> None:
     _save(fig, out_dir, "rq6_tunability")
 
 
+def plot_tunability_image_grid(rq6_dir: Path, out_dir: Path,
+                              llada_vary: str = "steps",
+                              image_vary: str = "cfg_scale") -> None:
+    """
+    RQ6 tunability as an IMAGE grid (4x4): actually shows the generated images
+    across the two tuning axes, so you can SEE how the output changes as you
+    turn each knob — not just a metric heatmap.
+
+    rows = 4 values of the LLaDA knob `llada_vary` (steps | gen_length)
+    cols = 4 values of the image knob `image_vary` (cfg_scale | num_inference_steps)
+    the OTHER knob on each layer is held fixed (at its first value) so each axis
+    is one interpretable dimension.
+
+    Reads the showcase images saved per cell at rq6/grid_images/L{li}_I{ii}.png.
+    Cell indexing (from _build_axes): li = steps_idx*4 + genlen_idx,
+    ii = imgsteps_idx*4 + cfg_idx, with values {32,64,96,128} / {10,25,50,100} /
+    cfg {2,5,7.5,12}.
+    """
+    plt = _style()
+    img_dir = Path(rq6_dir) / "grid_images"
+    if not img_dir.is_dir() or not any(img_dir.glob("*.png")):
+        logger.info("No rq6 showcase images in %s — skipping tunability image grid.", img_dir)
+        return
+    from PIL import Image
+
+    llada_steps = [32, 64, 96, 128]
+    llada_genlen = [32, 64, 96, 128]
+    img_steps = [10, 25, 50, 100]
+    img_cfg = [2.0, 5.0, 7.5, 12.0]
+
+    # Build the 4 LLaDA row indices and 4 image col indices for the chosen
+    # varying knob, holding the other at index 0.
+    if llada_vary == "steps":
+        row_vals = llada_steps
+        li_of = lambda r: r * 4 + 0            # vary steps, gen_length fixed at idx0
+        row_label = "LLaDA steps"
+    else:
+        row_vals = llada_genlen
+        li_of = lambda r: 0 * 4 + r            # vary gen_length, steps fixed at idx0
+        row_label = "LLaDA gen_length"
+
+    if image_vary == "cfg_scale":
+        col_vals = img_cfg
+        ii_of = lambda c: 0 * 4 + c            # vary cfg, img_steps fixed at idx0
+        col_label = "image CFG scale"
+    else:
+        col_vals = img_steps
+        ii_of = lambda c: c * 4 + 0            # vary img_steps, cfg fixed at idx0
+        col_label = "image inference steps"
+
+    fig, axes = plt.subplots(4, 4, figsize=(11, 11.6), squeeze=False)
+    for r in range(4):
+        for c in range(4):
+            ax = axes[r][c]
+            ax.axis("off")
+            p = img_dir / f"L{li_of(r)}_I{ii_of(c)}.png"
+            if p.exists():
+                try:
+                    ax.imshow(Image.open(p).convert("RGB"))
+                except Exception:
+                    ax.text(0.5, 0.5, "load err", ha="center", va="center", fontsize=8)
+            else:
+                ax.text(0.5, 0.5, "(missing)", ha="center", va="center",
+                        fontsize=9, color="#999", transform=ax.transAxes)
+            if r == 0:
+                ax.set_title(f"{col_label.split()[-1]}={col_vals[c]:g}", fontsize=9)
+            if c == 0:
+                ax.annotate(f"{row_vals[r]:g}", xy=(0, 0.5), xytext=(-8, 0),
+                            textcoords="offset points", xycoords="axes fraction",
+                            ha="right", va="center", fontsize=9, fontweight="bold")
+
+    fig.suptitle(f"RQ6 tunability — generated images across tuning axes\n"
+                 f"rows: {row_label} (top→bottom)   cols: {col_label} (left→right)",
+                 fontsize=12, fontweight="bold")
+    fig.tight_layout(rect=[0.03, 0, 1, 0.95])
+    _save(fig, out_dir, "rq6_image_grid")
+
+
+def plot_trajectory_cfg_lines(stab_dir: Path, out_dir: Path) -> None:
+    """
+    Denoising trajectory as LINE GRAPHS: metric (CLIPScore) vs denoising STEP,
+    one line per CFG scale, per pipeline. Shows how quality evolves THROUGH
+    generation and how guidance strength changes that evolution.
+
+    Reads the per-step records cfg_stability writes at
+    outputs/<backbone>/cfg_stability/<pipeline>/trajectory_cfg.jsonl
+    (fields: idx, cfg, step, clip_score), averaging over prompts per (cfg, step).
+    """
+    plt = _style()
+    stab_dir = Path(stab_dir)
+    if not stab_dir.is_dir():
+        logger.info("No cfg_stability dir %s — skipping trajectory line graphs.", stab_dir)
+        return
+    import numpy as np
+    from collections import defaultdict
+
+    traj_files = sorted(stab_dir.glob("*/trajectory_cfg.jsonl"))
+    if not traj_files:
+        logger.info("No trajectory_cfg.jsonl under %s — skipping.", stab_dir)
+        return
+
+    for tf in traj_files:
+        pipe = tf.parent.name
+        # (cfg, step) -> list of clip_scores
+        agg: dict = defaultdict(list)
+        for line in tf.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            try:
+                r = json.loads(line)
+                agg[(float(r["cfg"]), int(r["step"]))].append(r["clip_score"])
+            except Exception:
+                continue
+        if not agg:
+            continue
+
+        cfgs = sorted({k[0] for k in agg})
+        fig, ax = plt.subplots(figsize=(6.5, 4.5))
+        cmap = plt.cm.viridis(np.linspace(0, 0.9, len(cfgs)))
+        for col, cfg_v in zip(cmap, cfgs):
+            pts = sorted((s, np.mean(agg[(cfg_v, s)]))
+                         for (cv, s) in agg if cv == cfg_v)
+            if not pts:
+                continue
+            xs, ys = zip(*pts)
+            ax.plot(xs, ys, marker="o", ms=3, color=col, label=f"CFG {cfg_v:g}")
+        ax.set_xlabel("denoising step")
+        ax.set_ylabel("CLIPScore")
+        ax.set_title(f"Denoising trajectory by guidance scale — {pipe}")
+        ax.legend(fontsize=8, title="guidance")
+        _save(fig, out_dir, f"trajectory_cfg_lines_{pipe}")
+
+
+def plot_llada_trajectory(traj_dir: Path, out_dir: Path) -> None:
+    """
+    Language-layer trajectory: how a LLaDA rewrite emerges across unmasking
+    steps. Two panels:
+      (left)  unmasked fraction vs step — the unmasking schedule (mean +
+              individual prompt lines, faint).
+      (right) compositional content vs step — semantic density of the partial
+              decode (only if --track-content was used; skipped otherwise).
+
+    Reads outputs/<backbone>/llada_trajectory/trajectory.jsonl.
+    Visualises the diffusion mechanism's joint resolution — the language-side
+    counterpart to the image denoising trajectory, and unique vs AR.
+    """
+    plt = _style()
+    traj_path = Path(traj_dir) / "trajectory.jsonl"
+    if not traj_path.exists():
+        logger.info("No %s — skipping LLaDA trajectory plot.", traj_path)
+        return
+    import numpy as np
+    from collections import defaultdict
+
+    rows = []
+    for line in traj_path.read_text(encoding="utf-8").splitlines():
+        if line.strip():
+            try:
+                rows.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    if not rows:
+        return
+
+    has_content = any("semantic_density" in r for r in rows)
+    n_panels = 2 if has_content else 1
+    fig, axes = plt.subplots(1, n_panels, figsize=(6.0 * n_panels, 4.5), squeeze=False)
+    axes = axes[0]
+
+    # Panel 1: unmasked fraction vs step.
+    by_idx = defaultdict(list)
+    for r in rows:
+        by_idx[r["idx"]].append((r["step"], r.get("unmasked_fraction", np.nan)))
+    # faint per-prompt lines + bold mean
+    step_to_vals = defaultdict(list)
+    for idx, pts in by_idx.items():
+        pts.sort()
+        xs, ys = zip(*pts)
+        axes[0].plot(xs, ys, color="#7B5EA7", alpha=0.15, linewidth=0.8)
+        for s, v in pts:
+            step_to_vals[s].append(v)
+    steps = sorted(step_to_vals)
+    mean_unmask = [np.nanmean(step_to_vals[s]) for s in steps]
+    axes[0].plot(steps, mean_unmask, color="#7B5EA7", linewidth=2.4, label="mean")
+    axes[0].set_xlabel("unmasking step")
+    axes[0].set_ylabel("fraction of response unmasked")
+    axes[0].set_title("LLaDA unmasking schedule")
+    axes[0].legend(fontsize=9)
+
+    # Panel 2: semantic density vs step (compositional content emerging).
+    if has_content:
+        dens = defaultdict(list)
+        for r in rows:
+            if "semantic_density" in r:
+                dens[r["step"]].append(r["semantic_density"])
+        dsteps = sorted(dens)
+        dmean = [np.nanmean(dens[s]) for s in dsteps]
+        axes[1].plot(dsteps, dmean, color="#4C9F70", linewidth=2.4, marker="o", ms=3)
+        axes[1].set_xlabel("unmasking step")
+        axes[1].set_ylabel("semantic density of partial decode")
+        axes[1].set_title("Compositional content emerging through unmasking")
+
+    fig.suptitle("LLaDA language-layer trajectory (joint resolution)",
+                 fontsize=12, fontweight="bold")
+    fig.tight_layout(rect=[0, 0, 1, 0.95])
+    _save(fig, out_dir, "llada_trajectory")
+
+
 def generate_all_plots(
     output_root: str | Path = "outputs",
     rq3_results: Optional[dict] = None,
@@ -881,6 +1089,12 @@ def generate_all_plots(
 
     # RQ6 tunability heatmaps (if the sweep ran).
     plot_tunability_heatmaps(root / "rq6", plot_dir)
+    # RQ6 tunability IMAGE grid (the visual figure).
+    plot_tunability_image_grid(root / "rq6", plot_dir)
+    # Multi-CFG denoising trajectory line graphs (if cfg_stability ran).
+    plot_trajectory_cfg_lines(root / "cfg_stability", plot_dir)
+    # LLaDA language-layer trajectory (if the diagnostic ran).
+    plot_llada_trajectory(root / "llada_trajectory", plot_dir)
 
     logger.info("Plotting complete. Figures in %s", plot_dir)
 

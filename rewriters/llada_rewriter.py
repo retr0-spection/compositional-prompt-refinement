@@ -181,6 +181,126 @@ def _generate(
 
 
 # ---------------------------------------------------------------------------
+# Traced generate — language-layer trajectory instrumentation
+# ---------------------------------------------------------------------------
+# Same masked-diffusion loop as _generate, but records the partial response at
+# each unmasking step so we can visualise HOW the rewrite emerges: what
+# fraction of tokens are unmasked, and (optionally) how much compositional
+# content the partial decode already contains. This is the language-layer
+# analogue of the image denoising trajectory — and it directly visualises the
+# "joint resolution" that distinguishes the diffusion mechanism from AR, since
+# AR has no notion of a progressively-resolved whole sequence.
+
+@torch.no_grad()
+def _generate_traced(
+    model,
+    tokenizer,
+    prompt: torch.Tensor,
+    attention_mask: Optional[torch.Tensor] = None,
+    steps: int = 128,
+    gen_length: int = 128,
+    block_length: int = 128,
+    temperature: float = 0.0,
+    cfg_scale: float = 0.0,
+    remasking: str = "low_confidence",
+    mask_id: int = _MASK_ID,
+    extractor=None,
+) -> tuple[torch.Tensor, list[dict]]:
+    """
+    Like _generate, but returns (final_x, trajectory) where trajectory is a
+    list of per-step dicts: {step, unmasked_fraction, [attr_count, rel_count]}.
+
+    If `extractor` (a SemanticExtractor) is given, the partial response is
+    decoded and scene-graph-counted at each step so we can show compositional
+    content emerging through unmasking (slower; skip for speed).
+    """
+    x = torch.full(
+        (prompt.shape[0], prompt.shape[1] + gen_length), mask_id, dtype=torch.long,
+    ).to(model.device)
+    x[:, : prompt.shape[1]] = prompt.clone()
+
+    if attention_mask is not None:
+        attention_mask = torch.cat(
+            [attention_mask,
+             torch.ones((prompt.shape[0], gen_length),
+                        dtype=attention_mask.dtype, device=model.device)],
+            dim=-1,
+        )
+
+    prompt_index = x != mask_id
+    assert gen_length % block_length == 0
+    num_blocks = gen_length // block_length
+    assert steps % num_blocks == 0
+    steps_per_block = steps // num_blocks
+    prompt_len = prompt.shape[1]
+
+    trajectory: list[dict] = []
+    global_step = 0
+
+    for num_block in range(num_blocks):
+        block_start = prompt_len + num_block * block_length
+        block_end = prompt_len + (num_block + 1) * block_length
+        block_mask_index = x[:, block_start:block_end] == mask_id
+        num_transfer_tokens = _get_num_transfer_tokens(block_mask_index, steps_per_block)
+
+        for i in range(steps_per_block):
+            mask_index = x == mask_id
+            if cfg_scale > 0.0:
+                un_x = x.clone()
+                un_x[prompt_index] = mask_id
+                x_ = torch.cat([x, un_x], dim=0)
+                am_ = (torch.cat([attention_mask, attention_mask], dim=0)
+                       if attention_mask is not None else None)
+                logits = model(x_, attention_mask=am_).logits
+                logits, un_logits = torch.chunk(logits, 2, dim=0)
+                logits = un_logits + (cfg_scale + 1) * (logits - un_logits)
+            else:
+                logits = model(x, attention_mask=attention_mask).logits
+
+            logits_with_noise = _add_gumbel_noise(logits, temperature=temperature)
+            x0 = torch.argmax(logits_with_noise, dim=-1)
+            if remasking == "low_confidence":
+                p = F.softmax(logits, dim=-1)
+                x0_p = torch.squeeze(torch.gather(p, -1, torch.unsqueeze(x0, -1)), -1)
+            elif remasking == "random":
+                x0_p = torch.rand((x0.shape[0], x0.shape[1]), device=x0.device)
+            else:
+                raise NotImplementedError(remasking)
+
+            x0_p[:, block_end:] = -np.inf
+            x0 = torch.where(mask_index, x0, x)
+            confidence = torch.where(mask_index, x0_p, torch.full_like(x0_p, -np.inf))
+            transfer_index = torch.zeros_like(x0, dtype=torch.bool, device=x0.device)
+            for j in range(confidence.shape[0]):
+                _, sel = torch.topk(confidence[j], k=num_transfer_tokens[j, i])
+                transfer_index[j, sel] = True
+            x[transfer_index] = x0[transfer_index]
+
+            # --- record trajectory point (row 0 only) ---
+            resp = x[:, prompt_len:]
+            unmasked = (resp[0] != mask_id).float().mean().item()
+            rec = {"step": global_step, "unmasked_fraction": unmasked}
+            if extractor is not None:
+                # Decode the partial response (masked tokens -> skipped) and
+                # count compositional content so far.
+                partial_ids = resp[0].clone()
+                partial_ids = partial_ids[partial_ids != mask_id].unsqueeze(0)
+                try:
+                    text = tokenizer.batch_decode(
+                        partial_ids, skip_special_tokens=True)[0]
+                    g = extractor.extract(text)
+                    rec["attr_count"] = g["n_attribute_tokens"]
+                    rec["rel_count"] = g["n_relation_tokens"]
+                    rec["semantic_density"] = g["semantic_density"]
+                except Exception:
+                    pass
+            trajectory.append(rec)
+            global_step += 1
+
+    return x, trajectory
+
+
+# ---------------------------------------------------------------------------
 # Product-of-Experts joint denoising (RQ5 capstone)
 # ---------------------------------------------------------------------------
 # Standard _generate conditions on ONE prompt. PoE conditions on MULTIPLE
@@ -674,3 +794,43 @@ class LLaDARewriter(PromptRewriter):
             resp_ids, skip_special_tokens=True)[0].strip()
         logger.debug("LLaDA PoE composed %r -> %r", constraints, composed)
         return composed
+
+    # ------------------------------------------------------------------
+    # Language-layer trajectory (for the unmasking-step line graph)
+    # ------------------------------------------------------------------
+
+    def rewrite_with_trace(self, prompt: str, extractor=None) -> tuple[str, list[dict]]:
+        """
+        Rewrite a prompt while recording the per-unmasking-step trajectory.
+
+        Returns (expanded_text, trajectory), where trajectory is a list of
+        {step, unmasked_fraction, [attr_count, rel_count, semantic_density]}.
+        Pass a SemanticExtractor to also track compositional content emerging
+        through the unmasking process (slower).
+
+        This is a diagnostic (not cached) — use on a small prompt subset to
+        produce the language-layer trajectory figure.
+        """
+        self._load()
+        cfg = self.config
+        user_content = cfg.expansion_instruction.format(prompt=prompt)
+        formatted = self._tokenizer.apply_chat_template(
+            [{"role": "user", "content": user_content}],
+            add_generation_prompt=True, tokenize=False)
+        encoded = self._tokenizer(formatted, add_special_tokens=False,
+                                  return_tensors="pt")
+        input_ids = encoded["input_ids"].to(cfg.device)
+        attention_mask = encoded["attention_mask"].to(cfg.device)
+
+        out, trajectory = _generate_traced(
+            model=self._model, tokenizer=self._tokenizer,
+            prompt=input_ids, attention_mask=attention_mask,
+            steps=cfg.steps, gen_length=cfg.gen_length,
+            block_length=cfg.block_length, temperature=cfg.temperature,
+            cfg_scale=cfg.cfg_scale, remasking=cfg.remasking,
+            extractor=extractor,
+        )
+        response_ids = out[:, input_ids.shape[1]:]
+        expanded = self._tokenizer.batch_decode(
+            response_ids, skip_special_tokens=True)[0].strip()
+        return expanded, trajectory
