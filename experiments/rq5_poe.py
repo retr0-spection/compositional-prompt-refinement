@@ -138,19 +138,42 @@ def run_rq5(
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # ---- Build the conditioning TEXT for each condition, per prompt ----
-    logger.info("[RQ5] Preparing conditioning text for %d prompts x 4 conditions", len(prompts))
+    # ---- Stage 1: TEXT-level comparison (before any image) ----
+    # Runs first so we can see whether compose() even produces different text
+    # from rewrite(), with constraint-coverage broken down by type. Returns the
+    # per-prompt records (incl. the single_text and poe_text) so the image
+    # stage below REUSES them rather than recomputing compose() (which is
+    # expensive and uncached).
+    from experiments.rq5_text_compare import run_text_compare, _typed_constraints
+    logger.info("[RQ5] Stage 1: text-level comparison (single vs PoE)")
+    text_agg, text_records = run_text_compare(
+        prompts=prompts, llada_rewriter=llada_rewriter, extractor=extractor,
+        output_dir=output_dir.parent / "rq5_text", wandb_log=wandb_log,
+    )
+    # index text records by prompt idx for reuse
+    text_by_idx = {r["idx"]: r for r in text_records}
+
+    # ---- Stage 2: build the conditioning TEXT for each condition ----
+    logger.info("[RQ5] Stage 2: preparing conditioning text for %d prompts x 4 conditions", len(prompts))
     texts: dict[str, list[str]] = {c: [] for c in _CONDITIONS}
     decompositions: list[list[str]] = []
+    typed_per_prompt: list[list[dict]] = []
 
-    for prompt in prompts:
-        constraints = _decompose(prompt, extractor)
+    for i, prompt in enumerate(prompts):
+        rec = text_by_idx.get(i, {})
+        constraints = rec.get("constraints") or _typed_constraints(prompt, extractor)[0]
+        typed = rec.get("_typed") or _typed_constraints(prompt, extractor)[1]
         decompositions.append(constraints)
+        typed_per_prompt.append(typed)
 
         texts["raw"].append(prompt)
         texts["ar"].append(ar_rewriter.rewrite(prompt))
-        texts["llada_single"].append(llada_rewriter.rewrite(prompt))
-        texts["llada_poe"].append(llada_rewriter.compose(constraints))
+        # Reuse the rewrites already computed in Stage 1 (avoid recomputing the
+        # uncached compose()); fall back to computing if absent.
+        texts["llada_single"].append(
+            rec.get("single_text") or llada_rewriter.rewrite(prompt))
+        texts["llada_poe"].append(
+            rec.get("poe_text") or llada_rewriter.compose(constraints))
         logger.info("[RQ5] %r -> %d constraints", prompt[:50], len(constraints))
 
     # ---- Generate + score each condition ----
@@ -201,6 +224,30 @@ def run_rq5(
 
     agg = {c: _agg(c) for c in _CONDITIONS}
 
+    # ---- Per-constraint-TYPE aggregation (mean-field signature test) ----
+    # Attribute binding is a per-position property; spatial relations are a
+    # cross-position property. The mean-field PoE approximation is expected to
+    # help attributes more than relations. Reporting attr-vs-rel deltas
+    # separately surfaces that signature on the IMAGE side (mirroring the
+    # text-coverage per-type split in Stage 1).
+    #   attr_binding_accuracy already isolates attributes.
+    #   relation_accuracy already isolates relations.
+    # So the per-type deltas are just those two metrics compared PoE vs single.
+    per_type = {
+        "attr": {
+            "single": agg["llada_single"]["attr_binding_accuracy"],
+            "poe": agg["llada_poe"]["attr_binding_accuracy"],
+        },
+        "rel": {
+            "single": agg["llada_single"]["relation_accuracy"],
+            "poe": agg["llada_poe"]["relation_accuracy"],
+        },
+    }
+    for t in per_type:
+        s, p = per_type[t]["single"], per_type[t]["poe"]
+        per_type[t]["delta_poe_minus_single"] = (
+            p - s if (s == s and p == p) else float("nan"))
+
     # ---- PoE vs each baseline (the decisive comparisons) ----
     def _delta(metric: str, baseline: str) -> float:
         a, b = agg["llada_poe"][metric], agg[baseline][metric]
@@ -218,6 +265,8 @@ def run_rq5(
         json.dump(agg, f, indent=2, default=str)
     with open(output_dir / "rq5_comparison.json", "w", encoding="utf-8") as f:
         json.dump(comparison, f, indent=2, default=str)
+    with open(output_dir / "rq5_per_type.json", "w", encoding="utf-8") as f:
+        json.dump(per_type, f, indent=2, default=str)
 
     with open(output_dir / "rq5_summary.txt", "w", encoding="utf-8") as f:
         f.write("RQ5 - Product-of-Experts Composition (capstone)\n")
@@ -234,6 +283,12 @@ def run_rq5(
         for k, v in sorted(comparison.items()):
             vs = f"{v:+.4f}" if v == v else "n/a"
             f.write(f"  {k}: {vs}\n")
+        f.write("\nPer-constraint-type (PoE vs single) - mean-field signature:\n")
+        for t in ("attr", "rel"):
+            d = per_type[t]["delta_poe_minus_single"]
+            ds = f"{d:+.4f}" if d == d else "n/a"
+            f.write(f"  {t}: single={per_type[t]['single']}, "
+                    f"poe={per_type[t]['poe']}, delta={ds}\n")
 
     if wandb_log:
         flat = {}
@@ -248,4 +303,5 @@ def run_rq5(
                 {m: round(comparison[f"poe_vs_llada_single/{m}"], 4)
                  for m in ["clip_score", "attr_binding_accuracy", "relation_accuracy"]
                  if comparison[f"poe_vs_llada_single/{m}"] == comparison[f"poe_vs_llada_single/{m}"]})
-    return {"aggregate": agg, "comparison": comparison}
+    return {"aggregate": agg, "comparison": comparison, "per_type": per_type,
+            "text_comparison": text_agg}

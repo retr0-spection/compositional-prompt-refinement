@@ -1038,6 +1038,97 @@ def plot_llada_trajectory(traj_dir: Path, out_dir: Path) -> None:
     _save(fig, out_dir, "llada_trajectory")
 
 
+def plot_rq5_text_compare(rq5_text_dir: Path, out_dir: Path) -> None:
+    """
+    RQ5 text comparison figure: LLaDA (single) vs LLaDA+PoE rewrite TEXT.
+
+    Two panels:
+      (left)  a rendered TABLE of aggregate metrics (coverage/density/length),
+              single vs PoE with the delta coloured (green = PoE better).
+      (right) a grouped BAR chart of graph-coverage by constraint TYPE
+              (all / attr / rel), single vs PoE — the mean-field signature:
+              PoE is expected to lift attribute coverage more than relation
+              coverage if the per-position product is the mechanism.
+
+    Reads outputs/<backbone>/rq5_text/text_compare.json.
+    """
+    plt = _style()
+    p = Path(rq5_text_dir) / "text_compare.json"
+    if not p.exists():
+        logger.info("No %s — skipping RQ5 text-comparison figure.", p)
+        return
+    try:
+        agg = json.loads(p.read_text(encoding="utf-8"))
+    except Exception as exc:
+        logger.warning("Could not read RQ5 text compare (%s)", exc)
+        return
+    import numpy as np
+
+    single, poe = agg["single"], agg["poe"]
+    delta = agg["delta_poe_minus_single"]
+
+    fig, (ax_t, ax_b) = plt.subplots(1, 2, figsize=(13, 5),
+                                     gridspec_kw={"width_ratios": [1.35, 1]})
+
+    # -- left: table --
+    ax_t.axis("off")
+    rows = [
+        ("Graph coverage (all)", "graph_coverage_all"),
+        ("Graph coverage (attr)", "graph_coverage_attr"),
+        ("Graph coverage (rel)", "graph_coverage_rel"),
+        ("Literal coverage (all)", "literal_coverage_all"),
+        ("Literal coverage (attr)", "literal_coverage_attr"),
+        ("Literal coverage (rel)", "literal_coverage_rel"),
+        ("Attr count", "attr_count"),
+        ("Rel count", "rel_count"),
+        ("Word count", "word_count"),
+    ]
+    def _fmt(x):
+        return f"{x:.3f}" if isinstance(x, (int, float)) and x == x else "n/a"
+    cell_text, cell_colours = [], []
+    for label, key in rows:
+        s, pv, d = single.get(key), poe.get(key), delta.get(key)
+        cell_text.append([label, _fmt(s), _fmt(pv), (f"{d:+.3f}" if isinstance(d, (int, float)) and d == d else "n/a")])
+        # colour the delta cell green if PoE better, red if worse
+        dc = "#ffffff"
+        if isinstance(d, (int, float)) and d == d:
+            dc = "#d7ede0" if d > 0 else ("#f2d9d9" if d < 0 else "#ffffff")
+        cell_colours.append(["#ffffff", "#ffffff", "#ffffff", dc])
+    table = ax_t.table(
+        cellText=cell_text,
+        colLabels=["metric", "single", "PoE", "Δ(PoE−single)"],
+        cellColours=cell_colours,
+        loc="center", cellLoc="center",
+    )
+    table.auto_set_font_size(False)
+    table.set_fontsize(9)
+    table.scale(1, 1.5)
+    for (r, c), cell in table.get_celld().items():
+        if r == 0:
+            cell.set_text_props(fontweight="bold")
+        if c == 0 and r > 0:
+            cell.set_text_props(ha="left")
+    ax_t.set_title("RQ5 text metrics — LLaDA vs LLaDA+PoE", fontsize=11, fontweight="bold")
+
+    # -- right: graph-coverage-by-type grouped bars --
+    types = ["all", "attr", "rel"]
+    s_vals = [single.get(f"graph_coverage_{t}", np.nan) for t in types]
+    p_vals = [poe.get(f"graph_coverage_{t}", np.nan) for t in types]
+    x = np.arange(len(types)); w = 0.38
+    ax_b.bar(x - w/2, s_vals, w, label="LLaDA (single)", color="#BBBBBB")
+    ax_b.bar(x + w/2, p_vals, w, label="LLaDA + PoE", color="#7B5EA7")
+    ax_b.set_xticks(x); ax_b.set_xticklabels(["all", "attributes", "relations"])
+    ax_b.set_ylabel("constraint coverage (graph)")
+    ax_b.set_ylim(0, 1.05)
+    ax_b.set_title("Coverage by constraint type\n(mean-field signature: attr vs rel)",
+                   fontsize=10)
+    ax_b.legend(fontsize=9)
+
+    fig.suptitle("RQ5 — does PoE change the rewrite text?", fontsize=13, fontweight="bold")
+    fig.tight_layout(rect=[0, 0, 1, 0.95])
+    _save(fig, out_dir, "rq5_text_compare")
+
+
 def generate_all_plots(
     output_root: str | Path = "outputs",
     rq3_results: Optional[dict] = None,
@@ -1095,6 +1186,9 @@ def generate_all_plots(
     plot_trajectory_cfg_lines(root / "cfg_stability", plot_dir)
     # LLaDA language-layer trajectory (if the diagnostic ran).
     plot_llada_trajectory(root / "llada_trajectory", plot_dir)
+
+    # RQ5 text comparison (single vs PoE rewrite text).
+    plot_rq5_text_compare(root / "rq5_text", plot_dir)
 
     logger.info("Plotting complete. Figures in %s", plot_dir)
 
