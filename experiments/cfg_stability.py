@@ -109,10 +109,17 @@ def run_cfg_stability(
             logger.info("[cfg-stab][%s] CFG=%.1f over %d prompts",
                         pipeline.name, scale, len(prompts))
             for idx, enc in enumerate(enc_results):
-                # Backbone-agnostic trajectory call.
+                # Backbone-agnostic trajectory call. IMPORTANT: score every
+                # pipeline against the ORIGINAL prompt (user intent), not its
+                # own rewrite — otherwise each image is scored against the very
+                # text that conditioned it, which inflates rewrites unfairly and
+                # makes the cross-pipeline comparison meaningless. We still
+                # GENERATE from the rewritten text; we just SCORE against intent.
+                score_target = getattr(enc, "raw_prompt", None) or enc.rewritten_prompt
                 if v2_runner:
                     _, traj = runner.generate_with_trajectory(
                         prompt_text=enc.rewritten_prompt,
+                        score_text=score_target,
                         clip_scorer=clip_scorer,
                         cfg_scale=scale, seed=seed, score_every=score_every,
                     )

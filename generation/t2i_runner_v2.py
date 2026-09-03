@@ -333,15 +333,23 @@ class T2IRunnerV2:
         seed: Optional[int] = None,
         num_inference_steps: Optional[int] = None,
         score_every: int = 5,
+        score_text: Optional[str] = None,
     ) -> tuple[Image.Image, list[dict]]:
         """
         Generate while scoring the partially-denoised latent every
         `score_every` steps. Works for both backbones.
+
+        Generation is driven by `prompt_text` (the possibly-rewritten prompt).
+        Scoring uses `score_text` if given, else `prompt_text`. For a fair
+        cross-pipeline comparison, pass score_text = the ORIGINAL prompt so
+        every pipeline is scored against the same target (user intent), not
+        against its own rewrite.
         """
         self._load()
         cfg = self.config
         scale = cfg_scale if cfg_scale is not None else cfg.default_cfg_scale
         steps = num_inference_steps or cfg.num_inference_steps
+        target_text = score_text if score_text is not None else prompt_text
 
         cond = self._encode(prompt_text)
         generator = None
@@ -361,7 +369,7 @@ class T2IRunnerV2:
             )[0]
             imgs = pipe_ref.image_processor.postprocess(imgs, output_type="pil")
             try:
-                s = clip_scorer.score(imgs[0], prompt_text)
+                s = clip_scorer.score(imgs[0], target_text)
                 trajectory.append({"step": step, "clip_score": float(s)})
             except Exception as exc:
                 logger.debug("Trajectory scoring failed at step %d (%s)", step, exc)

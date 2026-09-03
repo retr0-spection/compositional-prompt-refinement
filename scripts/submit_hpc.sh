@@ -235,10 +235,37 @@ fi
 if [[ "$RQ" == "4" || "$RQ" == "5" || "$RQ" == "6" ]]; then
     echo ""
     echo "--- RQ${RQ}: single-process run (backbone=$BACKBONE) ---"
+
+    # RQ5 needs Ollama LIVE (scene-graph decomposition + coverage scoring via
+    # the SemanticExtractor, AND ar_rewriter for the AR condition on the new
+    # rq5_compositional prompts, which aren't in the warmup cache). The other
+    # RQs read only cached rewrites, so they don't. Start Ollama for RQ5.
+    OLLAMA_PID=""
+    if [[ "$RQ" == "5" ]]; then
+        OLLAMA_BIN="${OLLAMA_BIN:-$HOME/ollama-dist/bin/ollama}"
+        if [[ -x "$OLLAMA_BIN" ]]; then
+            echo "Starting Ollama for RQ5 (decomposition + AR rewrites)..."
+            "$OLLAMA_BIN" serve & OLLAMA_PID=$!
+            for i in $(seq 1 30); do
+                curl -sf http://localhost:11434/api/tags >/dev/null 2>&1 && break
+                if ! kill -0 "$OLLAMA_PID" 2>/dev/null; then
+                    echo "FATAL: Ollama died during startup." >&2; exit 1
+                fi
+                sleep 2
+            done
+            echo "Ollama ready (PID $OLLAMA_PID)."
+        else
+            echo "FATAL: RQ5 needs Ollama but binary not found at $OLLAMA_BIN" >&2
+            exit 1
+        fi
+    fi
+
     python experiments/run_experiment.py \
         --rq "$RQ" \
         --seed "${SEED:-42}" \
         "${BACKBONE_OVERRIDE[@]}"
+
+    [[ -n "$OLLAMA_PID" ]] && kill "$OLLAMA_PID" 2>/dev/null || true
 else
     PIPELINE_NAMES=("raw_clip" "ar_clip" "llada_clip")
     for PIPELINE_NAME in "${PIPELINE_NAMES[@]}"; do
