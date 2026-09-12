@@ -331,16 +331,21 @@ def _generate_poe(
     temperature: float = 0.0,
     remasking: str = "low_confidence",
     mask_id: int = _MASK_ID,
+    pad_id: int = 126081,
     device: str = "cuda",
 ) -> torch.Tensor:
     """
     Joint masked-diffusion denoising under a product of N expert constraints.
 
-    Returns the generated response ids (gen_length tokens) satisfying all
-    experts jointly. Experts are conditioning prefixes (already tokenised);
-    each gets its own canvas [prefix_i | shared_response], but the RESPONSE
-    region is kept in lock-step across experts — the same positions unmask at
-    the same step, driven by the summed (product-of-experts) confidence.
+    CRITICAL - positional alignment. LLaDA uses positional encodings, so the
+    shared response tokens MUST sit at the same absolute sequence positions in
+    every expert's canvas; otherwise each expert computes its distribution
+    under a different positional context and summing the logits produces
+    incoherent output (position-invariant filler tokens dominate the product,
+    causing degenerate repetition / comma-salad). We LEFT-PAD every expert
+    prefix to a common length p_max so all canvases are
+    [pad | prefix_i | response] with the response at the same offset p_max, and
+    pass an attention mask so the model ignores the padding.
     """
     n_exp = len(expert_prompts)
     assert n_exp >= 1
@@ -349,22 +354,32 @@ def _generate_poe(
     assert steps % num_blocks == 0
     steps_per_block = steps // num_blocks
 
-    # Build one canvas per expert: [expert_prefix | masked response].
-    # The response region (last gen_length tokens) is shared logically — we
-    # keep it identical across experts after every unmask.
-    canvases = []
-    prefix_lens = []
+    # Left-pad all prefixes to a common length so the shared response is
+    # positionally aligned across experts.
+    prefix_lens = [p.shape[1] for p in expert_prompts]
+    p_max = max(prefix_lens)
+    total_len = p_max + gen_length
+    resp_lo, resp_hi = p_max, p_max + gen_length
+
+    canvases = []      # (1, total_len) per expert
+    attn_masks = []    # (1, total_len) per expert: 1 real, 0 pad
     for pfx in expert_prompts:
         pfx = pfx.to(device)
-        L = pfx.shape[1]
-        prefix_lens.append(L)
-        x = torch.full((1, L + gen_length), mask_id, dtype=torch.long, device=device)
-        x[:, :L] = pfx.clone()
+        Lp = pfx.shape[1]
+        pad = p_max - Lp
+        x = torch.full((1, total_len), mask_id, dtype=torch.long, device=device)
+        if pad > 0:
+            x[:, :pad] = pad_id
+        x[:, pad:pad + Lp] = pfx.clone()
         canvases.append(x)
+        am = torch.ones((1, total_len), dtype=torch.long, device=device)
+        if pad > 0:
+            am[:, :pad] = 0
+        attn_masks.append(am)
 
-    # Response positions within each canvas start at prefix_len.
+    # Response region is the SAME slice for every expert now.
     def _resp_slice(e):
-        return slice(prefix_lens[e], prefix_lens[e] + gen_length)
+        return slice(resp_lo, resp_hi)
 
     for num_block in range(num_blocks):
         blk_lo = num_block * block_length
@@ -382,7 +397,7 @@ def _generate_poe(
             # Sum log-softmax over experts = product of expert distributions.
             summed_logprobs = None
             for e, x in enumerate(canvases):
-                logits = model(x).logits                    # (1, Le, vocab)
+                logits = model(x, attention_mask=attn_masks[e]).logits
                 resp_logits = logits[:, _resp_slice(e), :]  # (1, gen_length, vocab)
                 lp = F.log_softmax(resp_logits.to(torch.float64), dim=-1)
                 summed_logprobs = lp if summed_logprobs is None else summed_logprobs + lp
@@ -784,6 +799,8 @@ class LLaDARewriter(PromptRewriter):
             block_length=cfg.block_length,
             temperature=cfg.temperature,
             remasking=cfg.remasking,
+            pad_id=(self._tokenizer.pad_token_id
+                    if self._tokenizer.pad_token_id is not None else 126081),
             device=cfg.device,
         )
         if cfg.device == "cuda":
