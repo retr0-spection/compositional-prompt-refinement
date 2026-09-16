@@ -39,11 +39,46 @@ import logging
 from pathlib import Path
 from typing import Optional
 
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 
 logger = logging.getLogger(__name__)
 
 _CONDITIONS = ["raw", "ar", "llada_single", "llada_poe"]
+_COND_LABEL = {"raw": "RAW", "ar": "AR", "llada_single": "LLaDA",
+               "llada_poe": "LLaDA+PoE"}
+
+
+def _caption_image(img: Image.Image, prompt: str, condition: str) -> Image.Image:
+    """
+    Return a copy of `img` with a caption bar burned in at the bottom, so each
+    saved PNG is self-documenting (prompt + condition travel with the file).
+
+    The bar is added BELOW the image (image content is never overpainted).
+    """
+    w, h = img.size
+    # Caption bar height scales with image width; wrap the prompt to fit.
+    bar_h = max(48, w // 12)
+    canvas = Image.new("RGB", (w, h + bar_h), "white")
+    canvas.paste(img, (0, 0))
+    draw = ImageDraw.Draw(canvas)
+
+    # Font: fall back to default if truetype unavailable on the node.
+    try:
+        font = ImageFont.truetype("DejaVuSans.ttf", size=max(14, w // 45))
+        font_b = ImageFont.truetype("DejaVuSans-Bold.ttf", size=max(14, w // 45))
+    except Exception:
+        font = ImageFont.load_default()
+        font_b = font
+
+    label = _COND_LABEL.get(condition, condition)
+    # Wrap the prompt to the image width.
+    import textwrap
+    avg_char = max(1, w // max(1, (w // (max(8, w // 45)))))
+    wrapped = textwrap.fill(prompt, width=max(20, w // (max(8, w // 45))))
+    draw.text((8, h + 4), label, fill="#7B5EA7", font=font_b)
+    label_w = draw.textlength(label + "  ", font=font_b)
+    draw.text((8 + label_w, h + 4), wrapped, fill="#222222", font=font)
+    return canvas
 
 
 def _decompose(prompt: str, extractor) -> list[str]:
@@ -83,10 +118,19 @@ def _decompose(prompt: str, extractor) -> list[str]:
 
 
 def _generate_images(runner, texts: list[str], cfg_scale: float, seed: int,
-                     img_dir: Path) -> list[Image.Image]:
-    """Generate (or resume from disk) one image per text. Backbone-agnostic."""
+                     img_dir: Path, prompts: Optional[list[str]] = None,
+                     condition: str = "") -> list[Image.Image]:
+    """
+    Generate (or resume from disk) one image per text. Backbone-agnostic.
+
+    Saves the CLEAN image (used for scoring + figures) to img_dir, and a
+    self-documenting CAPTIONED copy (prompt + condition burned in) to
+    img_dir/_captioned/. The captioned copies are evidence artifacts only —
+    never scored (a caption bar would corrupt CLIPScore).
+    """
     from utils.naming import img_name
     img_dir.mkdir(parents=True, exist_ok=True)
+    cap_dir = img_dir / "_captioned"
 
     paths = [img_dir / img_name(i, cfg_scale, seed) for i in range(len(texts))]
     images: list[Optional[Image.Image]] = [None] * len(texts)
@@ -112,7 +156,59 @@ def _generate_images(runner, texts: list[str], cfg_scale: float, seed: int,
         for i, img in zip(missing, new):
             img.save(paths[i])
             images[i] = img
+
+    # Write self-documenting captioned copies (prompt burned in), for ALL
+    # images (cheap, idempotent). Uses the ORIGINAL prompt, not the rewrite.
+    if prompts is not None:
+        cap_dir.mkdir(parents=True, exist_ok=True)
+        for i, img in enumerate(images):
+            if img is None:
+                continue
+            try:
+                cap = _caption_image(img, prompts[i], condition)
+                cap.save(cap_dir / img_name(i, cfg_scale, seed))
+            except Exception as exc:
+                logger.debug("caption save failed for %d (%s)", i, exc)
+
     return images  # type: ignore
+
+
+def _write_prompt_evolution(path: Path, prompts: list[str],
+                            texts: dict[str, list[str]],
+                            decompositions: list[list[str]]) -> None:
+    """
+    Write a digestible prompt-evolution doc: for each prompt, show how the
+    conditioning text transforms raw -> AR -> LLaDA -> LLaDA+PoE, so the
+    mechanism differences are readable at a glance. Also emits a JSONL for
+    programmatic use / a rendered table later.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("RQ5 PROMPT EVOLUTION - raw -> AR -> LLaDA -> LLaDA+PoE\n")
+        f.write("=" * 68 + "\n")
+        f.write("How the conditioning TEXT transforms across the four mechanisms.\n\n")
+        for i, prompt in enumerate(prompts):
+            f.write(f"[{i}] ORIGINAL: {prompt}\n")
+            f.write(f"    constraints: {decompositions[i]}\n")
+            f.write(f"    RAW      : {texts['raw'][i]}\n")
+            f.write(f"    AR       : {texts['ar'][i]}\n")
+            f.write(f"    LLaDA    : {texts['llada_single'][i]}\n")
+            f.write(f"    LLaDA+PoE: {texts['llada_poe'][i]}\n")
+            f.write("-" * 68 + "\n")
+
+    # JSONL sidecar for a rendered table / downstream tooling.
+    with open(path.with_suffix(".jsonl"), "w", encoding="utf-8") as f:
+        for i, prompt in enumerate(prompts):
+            f.write(json.dumps({
+                "idx": i,
+                "original": prompt,
+                "constraints": decompositions[i],
+                "raw": texts["raw"][i],
+                "ar": texts["ar"][i],
+                "llada_single": texts["llada_single"][i],
+                "llada_poe": texts["llada_poe"][i],
+            }, ensure_ascii=False) + "\n")
+    logger.info("[RQ5] Prompt-evolution doc written to %s", path)
 
 
 def run_rq5(
@@ -176,13 +272,20 @@ def run_rq5(
             rec.get("poe_text") or llada_rewriter.compose(constraints))
         logger.info("[RQ5] %r -> %d constraints", prompt[:50], len(constraints))
 
+    # ---- Prompt-evolution doc: raw -> AR -> LLaDA -> PoE per prompt ----
+    # A digestible view of how the conditioning TEXT transforms across the four
+    # mechanisms, so the evolution is legible without opening four traces.
+    _write_prompt_evolution(output_dir / "prompt_evolution.txt",
+                            prompts, texts, decompositions)
+
     # ---- Generate + score each condition ----
     from utils.logging import log_metrics
     results: dict[str, list[dict]] = {c: [] for c in _CONDITIONS}
 
     for cond in _CONDITIONS:
         img_dir = output_dir / cond
-        images = _generate_images(runner, texts[cond], cfg_scale, seed, img_dir)
+        images = _generate_images(runner, texts[cond], cfg_scale, seed, img_dir,
+                                  prompts=prompts, condition=cond)
 
         for i, (img, prompt) in enumerate(zip(images, prompts)):
             # Score against the ORIGINAL compositional prompt (user intent),
@@ -303,5 +406,33 @@ def run_rq5(
                 {m: round(comparison[f"poe_vs_llada_single/{m}"], 4)
                  for m in ["clip_score", "attr_binding_accuracy", "relation_accuracy"]
                  if comparison[f"poe_vs_llada_single/{m}"] == comparison[f"poe_vs_llada_single/{m}"]})
+
+    # ---- Auto-generate the slide-ready image evidence figures ----
+    # The 4-condition grid (raw/AR/LLaDA/PoE side by side) and the focused
+    # LLaDA-vs-PoE paired figure, reading the images just written above so the
+    # image evidence appears without a manual step. Non-fatal on error.
+    backbone = output_dir.parent.name          # outputs/<backbone>/rq5 -> <backbone>
+    outputs_root = output_dir.parent.parent
+    try:
+        import subprocess, sys
+        n_show = min(6, len(prompts))
+        subprocess.run(
+            [sys.executable, "-m", "evaluation.figure_grid",
+             "--preset", "poe", "--backbone", backbone,
+             "--outputs", str(outputs_root),
+             "--select", "first", "--n", str(n_show)],
+            check=False,
+        )
+        subprocess.run(
+            [sys.executable, "-m", "evaluation.figure_poe_grid",
+             "--backbone", backbone, "--outputs", str(outputs_root),
+             "--select", "best", "--n", str(n_show)],
+            check=False,
+        )
+        logger.info("[RQ5] Image evidence figures written to %s/plots/figures/",
+                    outputs_root / backbone)
+    except Exception as exc:
+        logger.warning("[RQ5] figure generation failed (non-fatal): %s", exc)
+
     return {"aggregate": agg, "comparison": comparison, "per_type": per_type,
             "text_comparison": text_agg}
