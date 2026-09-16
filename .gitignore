@@ -84,3 +84,5 @@ secrets.yaml
 *.log
 tmp/
 temp/
+
+writeup/
