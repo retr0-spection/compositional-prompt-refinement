@@ -762,72 +762,99 @@ def plot_cfg_stability(stab_dir: Path, out_dir: Path) -> None:
     _save(fig, out_dir, "cfg_stability")
 
 
-def plot_tunability_heatmaps(rq6_dir: Path, out_dir: Path) -> None:
+def plot_rq6_cfg_saturation(rq6_dir: Path, out_dir: Path) -> None:
     """
-    RQ6 tunability: heatmaps over the 16x16 (LLaDA x image) config grid for
-    quality (CLIPScore), total time, and generation time. Reads
-    outputs/<backbone>/rq6/grid.jsonl.
+    RQ6 tunability, quality axis: CLIPScore versus guidance scale, one line per
+    image-step count, averaged over the LLaDA axis of the grid.
 
-    Axes: rows = LLaDA config index (steps x gen_length),
-          cols = image config index (num_inference_steps x cfg_scale).
-    The SHAPE of the surface is the result — which region is fast/good, and
-    how steerable each axis is (steepness of the gradient).
+    Reads outputs/<backbone>/rq6/grid.jsonl. This replaces the tunability
+    heatmaps: the CLIPScore surface barely varies, so a heatmap understates the
+    one real quality signal (the CFG axis). Plotting CLIPScore against CFG with
+    the y-axis zoomed to the true range shows two findings at once:
+      (i)  the concave, saturating shape of the CFG response (large gain from
+           w=2 to w=5, then a plateau), and
+      (ii) the near-coincidence of the step-count lines, which shows that the
+           step count has little effect on quality once a minimum is reached.
     """
     plt = _style()
     grid_path = Path(rq6_dir) / "grid.jsonl"
     if not grid_path.exists():
-        logger.info("No %s — skipping tunability heatmaps.", grid_path)
+        logger.info("No %s — skipping RQ6 CFG-saturation plot.", grid_path)
         return
     import numpy as np
+    from collections import defaultdict
 
     rows = []
     for line in grid_path.read_text(encoding="utf-8").splitlines():
         if line.strip():
-            rows.append(json.loads(line))
+            try:
+                rows.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
     if not rows:
         return
 
-    n_l = max(r["llada_idx"] for r in rows) + 1
-    n_i = max(r["image_idx"] for r in rows) + 1
+    # Average CLIPScore over the LLaDA axis, grouped by (img_steps, cfg).
+    by_key: dict = defaultdict(list)
+    for r in rows:
+        by_key[(int(r["img_steps"]), float(r["cfg_scale"]))].append(r["mean_clip_score"])
 
-    def _grid(key):
-        g = np.full((n_l, n_i), np.nan)
-        for r in rows:
-            g[r["llada_idx"], r["image_idx"]] = r.get(key, np.nan)
-        return g
+    img_steps = sorted({k[0] for k in by_key})
+    cfgs = sorted({k[1] for k in by_key})
 
-    panels = [
-        ("mean_clip_score", "CLIPScore (quality)", "viridis"),
-        ("total_time", "Total time (s/prompt)", "magma_r"),
-        ("mean_gen_time", "Image gen time (s/prompt)", "magma_r"),
-    ]
-    fig, axes = plt.subplots(1, len(panels), figsize=(5 * len(panels), 4.6))
-    if len(panels) == 1:
-        axes = [axes]
+    fig, ax = plt.subplots(figsize=(6.5, 4.5))
+    cmap = plt.cm.viridis(np.linspace(0, 0.85, len(img_steps)))
+    for col, steps in zip(cmap, img_steps):
+        ys = [np.mean(by_key[(steps, c)]) if (steps, c) in by_key else np.nan
+              for c in cfgs]
+        ax.plot(cfgs, ys, marker="o", color=col, label=f"{steps} steps")
 
-    for ax, (key, title, cmap) in zip(axes, panels):
-        g = _grid(key)
-        im = ax.imshow(g, aspect="auto", cmap=cmap, origin="lower")
-        ax.set_title(title, fontsize=10)
-        ax.set_xlabel("image config idx\n(steps x cfg)")
-        ax.set_ylabel("LLaDA config idx\n(steps x gen_length)")
-        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    ax.set_xlabel("CFG scale $w$")
+    ax.set_ylabel("mean CLIPScore")
+    ax.set_title("RQ6 — CLIPScore vs guidance scale (lines: image steps)")
+    ax.legend(fontsize=8, title="image steps")
+    _save(fig, out_dir, "rq6_cfg_saturation")
 
-    # Annotate with steerability if available.
-    stab_path = Path(rq6_dir) / "steerability.json"
-    subtitle = ""
-    if stab_path.exists():
-        try:
-            s = json.loads(stab_path.read_text(encoding="utf-8"))
-            subtitle = (f"steerability: image-axis={s['image_axis_steerability']:.4f}, "
-                        f"LLaDA-axis={s['llada_axis_steerability']:.4f} "
-                        f"(mean |ΔCLIP| between adjacent cells)")
-        except Exception:
-            pass
-    fig.suptitle("RQ6 — tunability surface" + (f"\n{subtitle}" if subtitle else ""),
-                 fontsize=11)
-    fig.tight_layout(rect=[0, 0, 1, 0.94])
-    _save(fig, out_dir, "rq6_tunability")
+
+def plot_rq6_time(rq6_dir: Path, out_dir: Path) -> None:
+    """
+    RQ6 tunability, cost axis: mean image-generation time versus image-step
+    count, showing the near-linear cost scaling. Averaged over all other grid
+    dimensions. Reads outputs/<backbone>/rq6/grid.jsonl.
+
+    Paired with plot_rq6_cfg_saturation, this makes the efficiency point: cost
+    grows roughly linearly with the step count while CLIPScore stays flat.
+    """
+    plt = _style()
+    grid_path = Path(rq6_dir) / "grid.jsonl"
+    if not grid_path.exists():
+        logger.info("No %s — skipping RQ6 time plot.", grid_path)
+        return
+    import numpy as np
+    from collections import defaultdict
+
+    rows = []
+    for line in grid_path.read_text(encoding="utf-8").splitlines():
+        if line.strip():
+            try:
+                rows.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    if not rows:
+        return
+
+    by_steps: dict = defaultdict(list)
+    for r in rows:
+        by_steps[int(r["img_steps"])].append(r["mean_gen_time"])
+    img_steps = sorted(by_steps)
+    means = [np.mean(by_steps[s]) for s in img_steps]
+
+    fig, ax = plt.subplots(figsize=(6.0, 4.5))
+    ax.plot(img_steps, means, marker="o", color="#C0504D")
+    ax.set_xlabel("image inference steps")
+    ax.set_ylabel("mean image generation time (s)")
+    ax.set_title("RQ6 — generation cost vs image steps (near-linear)")
+    _save(fig, out_dir, "rq6_time")
 
 
 def plot_tunability_image_grid(rq6_dir: Path, out_dir: Path,
@@ -1129,6 +1156,83 @@ def plot_rq5_text_compare(rq5_text_dir: Path, out_dir: Path) -> None:
     _save(fig, out_dir, "rq5_text_compare")
 
 
+def plot_embedding_pca(output_root: Path, out_dir: Path,
+                       backbones: Sequence[str] = ("sd21", "sdxl")) -> None:
+    """
+    Illustrate the RQ1 separation-gain finding with a 2D PCA projection of the
+    conditioning embeddings, one panel per backbone, points coloured by
+    pipeline (raw / AR / LLaDA).
+
+    Reads outputs/<backbone>/rq1/embeddings/<pipeline>.npz, produced by
+    experiments/export_embeddings.py. Per backbone, a single PCA is fitted on
+    all pipelines' embeddings together so the pipelines share one projection
+    and are directly comparable within the panel.
+
+    PCA is used deliberately: it is a linear, deterministic projection that,
+    unlike t-SNE or UMAP, cannot manufacture apparent clusters or hide real
+    ones. It is therefore an honest illustration of the separation structure.
+    The rigorous quantity remains the separation gain (\\Cref{eq:separation}),
+    computed in the full embedding space; this figure visualises it.
+    """
+    plt = _style()
+    import numpy as np
+
+    # Which backbones actually have exported embeddings?
+    present = []
+    for bb in backbones:
+        d = Path(output_root) / bb / "rq1" / "embeddings"
+        if d.is_dir() and any(d.glob("*.npz")):
+            present.append(bb)
+    if not present:
+        logger.info("No exported embeddings under outputs/<backbone>/rq1/embeddings "
+                    "— skipping PCA projection. Run experiments/export_embeddings.py.")
+        return
+
+    fig, axes = plt.subplots(1, len(present), figsize=(5.4 * len(present), 5.0),
+                             squeeze=False)
+    axes = axes[0]
+
+    label_map = {"raw_clip": "raw", "ar_clip": "AR", "llada_clip": "LLaDA"}
+
+    for ax, bb in zip(axes, present):
+        emb_dir = Path(output_root) / bb / "rq1" / "embeddings"
+        # Load each pipeline's matrix.
+        mats: dict[str, np.ndarray] = {}
+        for f in sorted(emb_dir.glob("*.npz")):
+            try:
+                mats[f.stem] = np.load(f, allow_pickle=True)["pooled"]
+            except Exception as exc:
+                logger.warning("Could not load %s (%s)", f, exc)
+        pipes = [p for p in _PIPELINE_ORDER if p in mats]
+        if not pipes:
+            continue
+
+        # Fit ONE PCA on all pipelines' embeddings together (shared projection).
+        stacked = np.concatenate([mats[p] for p in pipes], axis=0)
+        # Centre, then PCA via SVD (deterministic, no sklearn dependency).
+        mean = stacked.mean(axis=0, keepdims=True)
+        centred = stacked - mean
+        # top-2 right singular vectors
+        _, _, vt = np.linalg.svd(centred, full_matrices=False)
+        components = vt[:2]  # (2, hidden)
+
+        for p in pipes:
+            proj = (mats[p] - mean) @ components.T  # (n, 2)
+            ax.scatter(proj[:, 0], proj[:, 1], s=14, alpha=0.6,
+                       label=label_map.get(p, p),
+                       color=_PIPELINE_COLOURS.get(p, "#333"))
+
+        ax.set_title(f"{bb}", fontsize=12, fontweight="bold")
+        ax.set_xlabel("PC 1")
+        ax.set_ylabel("PC 2")
+        ax.legend(fontsize=9)
+
+    fig.suptitle("Conditioning-embedding structure (PCA projection)",
+                 fontsize=13, fontweight="bold")
+    fig.tight_layout(rect=[0, 0, 1, 0.95])
+    _save(fig, out_dir, "rq1_embedding_pca")
+
+
 def generate_all_plots(
     output_root: str | Path = "outputs",
     rq3_results: Optional[dict] = None,
@@ -1146,6 +1250,8 @@ def generate_all_plots(
 
     # RQ1 — density + separation gain.
     plot_rq1_density(root / "rq1", plot_dir)
+    # RQ1 — PCA projection of conditioning embeddings (if exported).
+    plot_embedding_pca(root, plot_dir)
 
     # RQ2 bars — CLIPScore always; accuracy metrics where applicable.
     for m in ("clip_score", "attr", "relation"):
@@ -1178,8 +1284,10 @@ def generate_all_plots(
     # CFG-stability across denoising steps (diagnostic).
     plot_cfg_stability(root / "cfg_stability", plot_dir)
 
-    # RQ6 tunability heatmaps (if the sweep ran).
-    plot_tunability_heatmaps(root / "rq6", plot_dir)
+    # RQ6 tunability: CFG-saturation quality curve + cost curve (replaces the
+    # heatmaps, which understated the flat CLIPScore surface).
+    plot_rq6_cfg_saturation(root / "rq6", plot_dir)
+    plot_rq6_time(root / "rq6", plot_dir)
     # RQ6 tunability IMAGE grid (the visual figure).
     plot_tunability_image_grid(root / "rq6", plot_dir)
     # Multi-CFG denoising trajectory line graphs (if cfg_stability ran).
