@@ -1260,6 +1260,28 @@ def generate_all_plots(
     # RQ2 FID — reads sidecars (traces don't carry FID).
     plot_rq2_fid(root / "rq2", plot_dir)
 
+    # RQ2 qualitative image grid (raw/AR/LLaDA side by side) for the main
+    # attribute sets, so each has a qualitative figure alongside the bars.
+    # Uses figure_grid's pipeline preset; the backbone is inferred from the
+    # output root's leaf name (outputs/<backbone>).
+    try:
+        from evaluation.figure_grid import build_figure
+        import argparse as _argparse
+        backbone = root.name if root.name in ("sd21", "sdxl") else "sdxl"
+        for _set in ("color_binding", "shape_binding", "texture_binding"):
+            ns = _argparse.Namespace(
+                preset="pipeline", outputs=str(root.parent), backbone=backbone,
+                pipeline="llada_clip", set=_set, select="first", n=6,
+                indices=None, seed=0, title=None, out=None,
+            )
+            try:
+                build_figure(ns, root.parent,
+                             plot_dir / "figures" / f"rq2_grid_{_set}")
+            except Exception as exc:
+                logger.debug("RQ2 grid for %s skipped (%s)", _set, exc)
+    except Exception as exc:
+        logger.debug("RQ2 qualitative grids skipped (%s)", exc)
+
     # RQ4 mechanism deltas (LLaDA vs AR) — the core comparison plot.
     plot_rq4_deltas(root / "rq4", plot_dir)
 
