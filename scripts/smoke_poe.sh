@@ -1,7 +1,8 @@
 #!/bin/bash
 #SBATCH --job-name=poe-smoke
 #SBATCH --partition=biggpu
-#SBATCH --gres=gpu:1
+#SBATCH --nodes=1
+#SBATCH --cpus-per-task=8
 #SBATCH --mem=24G
 #SBATCH --time=00:20:00
 #SBATCH --output=logs/slurm/poe_smoke_%j.out
