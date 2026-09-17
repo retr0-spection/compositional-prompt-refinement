@@ -72,24 +72,46 @@ class CFGSweepResult:
         """
         Stability across CFG scales, higher = less sensitive.
 
-        Defined as 1 - mean(coefficient of variation) over the available
-        metrics. Using the coefficient of variation (std / |mean|) instead of
-        raw variance makes the three metrics comparable despite living on very
-        different scales (CLIPScore ~0.18, accuracies ~0.1) — otherwise raw
-        variance lets whichever metric has the largest absolute values dominate
-        the score, which is the bug that produced near-identical ~0.9999
-        stability for every pipeline.
+        Defined as 1 - mean(coefficient of variation) over the RELIABLY-SAMPLED
+        metrics, namely CLIPScore and attribute accuracy. Using the coefficient
+        of variation (std / |mean|) instead of raw variance makes the metrics
+        comparable despite living on very different scales (CLIPScore ~0.27,
+        accuracies ~0.9) — otherwise raw variance lets whichever metric has the
+        largest absolute values dominate the score, which is the bug that
+        produced near-identical ~0.9999 stability for every pipeline.
+
+        The RELATION component is deliberately EXCLUDED from the headline
+        stability figure. In the CFG sweep set only a handful of prompts carry
+        an applicable spatial relation (typically about three after parsing),
+        so relation accuracy at each guidance scale is computed over too few
+        prompts to be reliable: its variation across scales is dominated by
+        which of those few prompts happens to succeed at each scale rather than
+        by any genuine sensitivity to guidance. Including it would inject
+        sampling noise into the stability comparison and, in practice, produced
+        a spurious apparent difference between pipelines. The relation
+        coefficient of variation is still recorded separately
+        (rel_accuracy_cv) for transparency, but is not aggregated into the
+        stability score.
 
         Metrics that are entirely NaN (no applicable prompts) are skipped.
         """
         cvs = [
             _coef_var(vals)
-            for vals in (self.clip_scores, self.attr_accuracies, self.rel_accuracies)
+            for vals in (self.clip_scores, self.attr_accuracies)
         ]
         cvs = [c for c in cvs if c is not None]
         if not cvs:
             return float("nan")
         return 1.0 - sum(cvs) / len(cvs)
+
+    @property
+    def rel_accuracy_cv(self) -> Optional[float]:
+        """
+        Coefficient of variation of relation accuracy across CFG scales,
+        recorded for transparency but NOT included in compositional_stability
+        (see that property for why the relation component is undersampled).
+        """
+        return _coef_var(self.rel_accuracies)
 
     def to_dict(self) -> dict:
         """Flat dict for W&B logging."""
@@ -99,6 +121,9 @@ class CFGSweepResult:
             f"{self.pipeline_name}/cfg_rel_variance": self.rel_accuracy_variance,
             f"{self.pipeline_name}/compositional_stability": self.compositional_stability,
         }
+        rel_cv = self.rel_accuracy_cv
+        if rel_cv is not None:
+            out[f"{self.pipeline_name}/rel_accuracy_cv"] = rel_cv
         for i, scale in enumerate(self.cfg_scales):
             tag = f"cfg{scale}"
             if i < len(self.clip_scores):
