@@ -4,7 +4,7 @@
 #SBATCH --nodes=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=24G
-#SBATCH --time=04:00:00
+#SBATCH --time=08:00:00
 #SBATCH --output=logs/slurm/poe_ablation_%j.out
 #SBATCH --error=logs/slurm/poe_ablation_%j.err
 # =============================================================================
@@ -26,6 +26,9 @@
 #   sbatch scripts/submit_ablation.sh                 # all 18 prompts
 #   LIMIT=4 sbatch scripts/submit_ablation.sh         # quick 4-prompt check
 #   OUT=outputs/sdxl/rq5_ablation sbatch scripts/submit_ablation.sh
+#   # fast first pass (minutes) to confirm timing before the full run:
+#   LIMIT=3 STEPS=64 VARIANTS=disjoint_nobase,shared_base_w1.0 \
+#       sbatch scripts/submit_ablation.sh
 #
 # Requirements: GPU (LLaDA-8B) and Ollama for scene-graph decomposition —
 # same as an RQ5 run. Weights are assumed already pulled (see submit_hpc.sh).
@@ -56,6 +59,8 @@ OUT="${OUT:-outputs/sdxl/rq5_ablation}"
 LIMIT="${LIMIT:-0}"                       # 0 = all prompts
 PROMPT_SET="${PROMPT_SET:-rq5_compositional}"
 OLLAMA_MODEL="${OLLAMA_MODEL:-llama3.1}"
+STEPS="${STEPS:-0}"            # 0 = LLaDA default (128); 64 for a faster pass
+VARIANTS="${VARIANTS:-}"       # comma-separated subset, empty = all four
 
 echo "========================================"
 echo "Job      : ${SLURM_JOB_ID:-<interactive>}"
@@ -103,6 +108,8 @@ fi
 # ------------------------------ run the ablation ----------------------------
 ABLATION_ARGS=(--prompt-set "$PROMPT_SET" --out "$OUT" --ollama-model "$OLLAMA_MODEL")
 [[ "$LIMIT" != "0" ]] && ABLATION_ARGS+=(--limit "$LIMIT")
+[[ "$STEPS" != "0" ]] && ABLATION_ARGS+=(--steps "$STEPS")
+[[ -n "$VARIANTS" ]] && ABLATION_ARGS+=(--variants "$VARIANTS")
 
 set +e
 python -m experiments.rq5_poe_ablation "${ABLATION_ARGS[@]}"
