@@ -62,6 +62,14 @@ _EXPANSION_INSTRUCTION = (
     "Prompt: {prompt}"
 )
 
+# Appended to the whole-scene instruction so ONE expert emphasises a single
+# constraint (the "shared_scene" PoE construction). Every expert still sees the
+# entire scene, so objects stay positionally aligned and the product sharpens
+# the constraint instead of colliding into filler.
+_POE_FOCUS_SUFFIX = (
+    "\n- Above all, make certain this is true in the image: {constraint}"
+)
+
 
 # ---------------------------------------------------------------------------
 # Official generate() — copied verbatim from ML-GSAI/LLaDA generate.py
@@ -333,6 +341,7 @@ def _generate_poe(
     mask_id: int = _MASK_ID,
     pad_id: int = 126081,
     device: str = "cuda",
+    weights: Optional[list[float]] = None,
 ) -> torch.Tensor:
     """
     Joint masked-diffusion denoising under a product of N expert constraints.
@@ -349,6 +358,8 @@ def _generate_poe(
     """
     n_exp = len(expert_prompts)
     assert n_exp >= 1
+    if weights is not None:
+        assert len(weights) == n_exp, "weights length must match experts"
     assert gen_length % block_length == 0
     num_blocks = gen_length // block_length
     assert steps % num_blocks == 0
@@ -400,6 +411,8 @@ def _generate_poe(
                 logits = model(x, attention_mask=attn_masks[e]).logits
                 resp_logits = logits[:, _resp_slice(e), :]  # (1, gen_length, vocab)
                 lp = F.log_softmax(resp_logits.to(torch.float64), dim=-1)
+                if weights is not None:
+                    lp = lp * float(weights[e])
                 summed_logprobs = lp if summed_logprobs is None else summed_logprobs + lp
 
             # Renormalise the product distribution.
@@ -462,6 +475,16 @@ class LLaDARewriterConfig:
 
     expansion_instruction: str = _EXPANSION_INSTRUCTION
     cache_path: Optional[str] = None  # path to rewrite cache JSON file
+
+    # ---- Product-of-Experts composition controls (RQ5) ----
+    # "shared_scene": every expert conditions on the FULL scene and is told
+    #   to emphasise one constraint (objects stay positionally aligned).
+    # "disjoint": original behaviour, each expert sees only its own
+    #   constraint (kept for ablation; collapses on competing objects).
+    poe_expert_mode: str = "shared_scene"
+    poe_base_expert: bool = True     # add a whole-scene, no-focus fluency anchor
+    poe_base_weight: float = 1.0     # weight of the fluency-anchor expert
+    poe_focus_weight: float = 1.0    # weight of each constraint expert
 
 
 # ---------------------------------------------------------------------------
@@ -754,7 +777,11 @@ class LLaDARewriter(PromptRewriter):
     # Product-of-Experts composition (RQ5 capstone)
     # ------------------------------------------------------------------
 
-    def compose(self, constraints: list[str]) -> str:
+    def compose(
+        self,
+        constraints: list[str],
+        full_prompt: Optional[str] = None,
+    ) -> str:
         """
         Compose multiple constraints into ONE refined description via joint
         masked-diffusion denoising (product of experts).
@@ -778,22 +805,53 @@ class LLaDARewriter(PromptRewriter):
         self._load()
         cfg = self.config
 
-        # Each constraint gets the expansion instruction as its expert prefix,
-        # so every expert is "describe an image where <constraint>".
-        expert_prefixes = []
-        for c in constraints:
-            msg = [{"role": "user",
-                    "content": cfg.expansion_instruction.format(prompt=c)}]
+        # ---- Build the expert prefixes -----------------------------------
+        # See LLaDARewriterConfig.poe_expert_mode. In "shared_scene" every
+        # expert conditions on the whole scene and emphasises one constraint,
+        # which keeps the objects positionally aligned across experts so the
+        # product sharpens attributes rather than collapsing into filler.
+        mode = cfg.poe_expert_mode
+        if full_prompt is None:
+            # Reconstruct a scene description from the constraints if the caller
+            # did not supply the original prompt.
+            full_prompt = ", ".join(constraints)
+
+        def _encode(content: str) -> torch.Tensor:
             formatted = self._tokenizer.apply_chat_template(
-                msg, add_generation_prompt=True, tokenize=False)
-            ids = self._tokenizer(formatted, add_special_tokens=False,
-                                  return_tensors="pt")["input_ids"]
-            expert_prefixes.append(ids)
+                [{"role": "user", "content": content}],
+                add_generation_prompt=True, tokenize=False)
+            return self._tokenizer(formatted, add_special_tokens=False,
+                                   return_tensors="pt")["input_ids"]
+
+        expert_prefixes: list[torch.Tensor] = []
+        weights: list[float] = []
+
+        if mode == "disjoint":
+            for c in constraints:
+                expert_prefixes.append(
+                    _encode(cfg.expansion_instruction.format(prompt=c)))
+                weights.append(cfg.poe_focus_weight)
+        elif mode == "shared_scene":
+            scene = cfg.expansion_instruction.format(prompt=full_prompt)
+            for c in constraints:
+                content = scene + _POE_FOCUS_SUFFIX.format(constraint=c)
+                expert_prefixes.append(_encode(content))
+                weights.append(cfg.poe_focus_weight)
+        else:
+            raise ValueError(f"unknown poe_expert_mode: {mode!r}")
+
+        # Optional whole-scene fluency anchor (no focus): penalises
+        # ungrammatical filler and holds the object inventory in place.
+        if cfg.poe_base_expert:
+            expert_prefixes.append(
+                _encode(cfg.expansion_instruction.format(prompt=full_prompt)))
+            weights.append(cfg.poe_base_weight)
 
         _t0 = time.perf_counter()
         resp_ids = _generate_poe(
             model=self._model,
             expert_prompts=expert_prefixes,
+            weights=weights,
             gen_length=cfg.gen_length,
             steps=cfg.steps,
             block_length=cfg.block_length,

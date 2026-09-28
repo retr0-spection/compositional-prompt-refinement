@@ -188,7 +188,7 @@ def run_text_compare(
                     i + 1, len(prompts), prompt[:50], len(constraints))
 
         single_text = llada_rewriter.rewrite(prompt)
-        poe_text = llada_rewriter.compose(constraints)
+        poe_text = llada_rewriter.compose(constraints, full_prompt=prompt)
 
         single_cov = _coverage(typed, single_text, extractor)
         poe_cov = _coverage(typed, poe_text, extractor)
