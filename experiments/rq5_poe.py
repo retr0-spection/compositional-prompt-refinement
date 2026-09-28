@@ -269,7 +269,7 @@ def run_rq5(
         texts["llada_single"].append(
             rec.get("single_text") or llada_rewriter.rewrite(prompt))
         texts["llada_poe"].append(
-            rec.get("poe_text") or llada_rewriter.compose(constraints))
+            rec.get("poe_text") or llada_rewriter.compose(constraints, full_prompt=prompt))
         logger.info("[RQ5] %r -> %d constraints", prompt[:50], len(constraints))
 
     # ---- Prompt-evolution doc: raw -> AR -> LLaDA -> PoE per prompt ----
