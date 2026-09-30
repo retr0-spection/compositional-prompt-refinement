@@ -67,7 +67,7 @@ TIME_RQ1="01:00:00"         # RQ1: text + embeddings, all cache hits → fast
 TIME_RQ2="12:00:00"         # RQ2: image gen (50 steps × 500 prompts) + BLIP-2 scoring
 TIME_RQ3="06:00:00"         # RQ3: CFG sweep over 25 prompts × 5 scales
 TIME_RQ4="08:00:00"         # RQ4: AR vs LLaDA head-to-head
-TIME_RQ5="06:00:00"         # RQ5: PoE capstone, ~15-20 prompts x 4 conditions
+TIME_RQ5="08:00:00"   # raised for the 100-prompt RQ5 capstone         # RQ5: PoE capstone, ~15-20 prompts x 4 conditions
 TIME_RQ6="12:00:00"         # RQ6: 256-cell tunability grid x 15 prompts
 
 # ---------------------------------------------------------------------------
@@ -681,7 +681,7 @@ for BACKBONE in "${BACKBONES[@]}"; do
                 2) TIME_LIMIT="24:00:00"; MEM_LIMIT="24G" ;;
                 3) TIME_LIMIT="12:00:00"; MEM_LIMIT="12G" ;;
                 4) TIME_LIMIT="18:00:00"; MEM_LIMIT="24G" ;;
-                5) TIME_LIMIT="08:00:00"; MEM_LIMIT="24G" ;;
+                5) TIME_LIMIT="12:00:00"; MEM_LIMIT="24G" ;;
                 6) TIME_LIMIT="24:00:00"; MEM_LIMIT="24G" ;;
             esac
         fi
