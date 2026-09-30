@@ -68,8 +68,10 @@ ALL_VARIANTS: dict[str, Variant] = {
     v.name: v for v in [
         Variant("disjoint_nobase",  "disjoint",     base_expert=False),
         Variant("shared_nobase",    "shared_scene", base_expert=False),
-        Variant("shared_base_w1.0", "shared_scene", base_expert=True, base_weight=1.0),
         Variant("shared_base_w0.5", "shared_scene", base_expert=True, base_weight=0.5),
+        Variant("shared_base_w1.0", "shared_scene", base_expert=True, base_weight=1.0),
+        Variant("shared_base_w1.5", "shared_scene", base_expert=True, base_weight=1.5),
+        Variant("shared_base_w2.0", "shared_scene", base_expert=True, base_weight=2.0),
     ]
 }
 DEFAULT_ORDER = list(ALL_VARIANTS.keys())

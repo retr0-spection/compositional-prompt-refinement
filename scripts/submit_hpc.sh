@@ -544,6 +544,10 @@ python experiments/trajectory.py --n-prompts 8 \
 [[ -n "$OLLAMA_PID" ]] && kill "$OLLAMA_PID" 2>/dev/null || true
 
 # Regenerate plots so the new diagnostic figures render.
+# Export RQ1 conditioning embeddings so the PCA projection figure can render.
+echo ""; echo "--- export embeddings (RQ1 PCA) ---"
+python -m experiments.export_embeddings "${OVERRIDE[@]}" || echo "WARN: embedding export failed (non-fatal)."
+
 echo ""; echo "--- Regenerating plots (outputs/${BACKBONE}) ---"
 python -m evaluation.plotting "outputs/${BACKBONE}" || echo "WARN: plotting failed (non-fatal)."
 echo "Diagnostics complete for $BACKBONE."
