@@ -1,11 +1,11 @@
 #!/bin/bash
-#SBATCH --job-name=clip_traj
+#SBATCH --job-name=rq5_cfgrob
 #SBATCH --partition=biggpu
 #SBATCH --nodes=1
 #SBATCH --nodelist=mscluster106,mscluster107
-#SBATCH --time=02:00:00
-#SBATCH --output=logs/slurm/cliptraj_%j.out
-#SBATCH --error=logs/slurm/cliptraj_%j.err
+#SBATCH --time=04:00:00
+#SBATCH --output=logs/slurm/rq5_cfgrob_%j.out
+#SBATCH --error=logs/slurm/rq5_cfgrob_%j.err
 set -euo pipefail
 cd "${SLURM_SUBMIT_DIR:?}"
 source "$HOME/miniconda3/etc/profile.d/conda.sh"
@@ -13,4 +13,4 @@ conda activate prompt-pipeline
 export LANG=C.UTF-8 LC_ALL=C.UTF-8 PYTHONIOENCODING=utf-8
 echo "node: $(hostname)"; nvidia-smi --query-gpu=name,memory.free --format=csv,noheader
 export PYTHONPATH="${SLURM_SUBMIT_DIR}:${PYTHONPATH:-}"
-python experiments/clip_trajectory.py
+python experiments/rq5_cfg_robustness.py

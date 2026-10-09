@@ -1,13 +1,15 @@
-"""CLIP-score denoising trajectory diagnostic (CFG sweep).
+"""RQ5 x RQ6 -- image-space CLIP trajectory during denoising (CFG sweep).
 
 For a small prompt sample, generate with SDXL and, at a cadence through the
 reverse-diffusion loop, decode the current latent to a preview image and score
 CLIPScore against the ORIGINAL prompt. Shows how prompt alignment emerges
-(sigmoid-like) and whether conditioning (raw / single / PoE) changes the shape
--- now swept across guidance scales to test whether higher CFG lets the
-rewriters' richer conditioning pay off (ties RQ5 to the RQ6 steerability result).
+(sigmoid-like) and whether conditioning (raw / single / PoE) changes the shape,
+swept across guidance scales (default vs high).
 
-Output: outputs/sdxl/diagnostics/clip_trajectory.jsonl
+Distinct from experiments/trajectory.py (RQ4 denoising diag) and
+experiments/llada_trajectory.py (LLaDA text-diffusion unmasking).
+
+Output: outputs/sdxl/rq5_clip_trajectory/clip_vs_step.jsonl
         {cond, cfg, idx, step, frac, clip}
 
 Note: decodes the current latent (noisy early) - an approximate preview, not the
@@ -25,7 +27,7 @@ CFGS = [7.5, 15.0]  # default vs high-guidance (steerability regime)
 SEED = 42
 EVERY = 5
 N_PROMPTS = 10
-OUT = Path("outputs/sdxl/diagnostics")
+OUT = Path("outputs/sdxl/rq5_clip_trajectory")
 OUT.mkdir(parents=True, exist_ok=True)
 
 prompts, single, poe = [], {}, {}
@@ -63,7 +65,7 @@ for cfg in CFGS:
                  generator=g, callback_on_step_end=cb,
                  callback_on_step_end_tensor_inputs=["latents"])
 
-with open(OUT / "clip_trajectory.jsonl", "w") as f:
+with open(OUT / "clip_vs_step.jsonl", "w") as f:
     for r in records:
         f.write(json.dumps(r) + "\n")
-print("DONE_TRAJ", len(records), flush=True)
+print("DONE_RQ5_CLIP_TRAJECTORY", len(records), flush=True)
