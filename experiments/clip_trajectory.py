@@ -1,11 +1,14 @@
-"""CLIP-score denoising trajectory diagnostic.
+"""CLIP-score denoising trajectory diagnostic (CFG sweep).
 
 For a small prompt sample, generate with SDXL and, at a cadence through the
 reverse-diffusion loop, decode the current latent to a preview image and score
 CLIPScore against the ORIGINAL prompt. Shows how prompt alignment emerges
-(sigmoid-like) and whether conditioning (raw / single / PoE) changes the shape.
+(sigmoid-like) and whether conditioning (raw / single / PoE) changes the shape
+-- now swept across guidance scales to test whether higher CFG lets the
+rewriters' richer conditioning pay off (ties RQ5 to the RQ6 steerability result).
 
-Output: outputs/sdxl/diagnostics/clip_trajectory.jsonl  {cond, idx, step, frac, clip}
+Output: outputs/sdxl/diagnostics/clip_trajectory.jsonl
+        {cond, cfg, idx, step, frac, clip}
 
 Note: decodes the current latent (noisy early) - an approximate preview, not the
 model x0 estimate. Diagnostic only; 50 steps (vs the 100-step main run).
@@ -18,7 +21,7 @@ from evaluation.metrics import CLIPScorer
 
 MODEL = "stabilityai/stable-diffusion-xl-base-1.0"
 STEPS = 50
-CFG = 7.5
+CFGS = [7.5, 15.0]  # default vs high-guidance (steerability regime)
 SEED = 42
 EVERY = 5
 N_PROMPTS = 10
@@ -40,24 +43,25 @@ clip = CLIPScorer()
 records = []
 conditions = {"raw": lambda i: prompts[i], "single": lambda i: single[i], "poe": lambda i: poe[i]}
 
-for cond, textfn in conditions.items():
-    print("[" + cond + "]", flush=True)
-    for i in idxs:
-        orig = prompts[i]
-        def cb(pp, step, t, kw, _orig=orig, _cond=cond, _i=i):
-            if step % EVERY == 0 or step == STEPS - 1:
-                lat = kw["latents"].to(pp.vae.dtype) / pp.vae.config.scaling_factor
-                with torch.no_grad():
-                    im = pp.vae.decode(lat, return_dict=False)[0]
-                im = pp.image_processor.postprocess(im, output_type="pil")[0]
-                records.append({"cond": _cond, "idx": _i, "step": int(step),
-                                "frac": round((step + 1) / STEPS, 3),
-                                "clip": float(clip.score(im, _orig))})
-            return kw
-        g = torch.Generator("cuda").manual_seed(SEED)
-        pipe(prompt=textfn(i), num_inference_steps=STEPS, guidance_scale=CFG,
-             generator=g, callback_on_step_end=cb,
-             callback_on_step_end_tensor_inputs=["latents"])
+for cfg in CFGS:
+    for cond, textfn in conditions.items():
+        print("[cfg=" + str(cfg) + " " + cond + "]", flush=True)
+        for i in idxs:
+            orig = prompts[i]
+            def cb(pp, step, t, kw, _orig=orig, _cond=cond, _i=i, _cfg=cfg):
+                if step % EVERY == 0 or step == STEPS - 1:
+                    lat = kw["latents"].to(pp.vae.dtype) / pp.vae.config.scaling_factor
+                    with torch.no_grad():
+                        im = pp.vae.decode(lat, return_dict=False)[0]
+                    im = pp.image_processor.postprocess(im, output_type="pil")[0]
+                    records.append({"cond": _cond, "cfg": float(_cfg), "idx": _i,
+                                    "step": int(step), "frac": round((step + 1) / STEPS, 3),
+                                    "clip": float(clip.score(im, _orig))})
+                return kw
+            g = torch.Generator("cuda").manual_seed(SEED)
+            pipe(prompt=textfn(i), num_inference_steps=STEPS, guidance_scale=cfg,
+                 generator=g, callback_on_step_end=cb,
+                 callback_on_step_end_tensor_inputs=["latents"])
 
 with open(OUT / "clip_trajectory.jsonl", "w") as f:
     for r in records:
