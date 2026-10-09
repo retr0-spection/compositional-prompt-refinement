@@ -36,7 +36,8 @@ idxs = list(range(min(N_PROMPTS, len(prompts))))
 print("loading SDXL...", flush=True)
 pipe = StableDiffusionXLPipeline.from_pretrained(MODEL, torch_dtype=torch.float16).to("cuda")
 pipe.set_progress_bar_config(disable=True)
-pipe.upcast_vae()  # SDXL fp16 VAE stability for the final decode
+# NOTE: no manual upcast_vae() - the SDXL pipeline auto-upcasts the VAE
+# for its final fp16 decode; calling upcast_vae() here breaks that (Half vs float).
 clip = CLIPScorer()
 
 conditions = {"raw": lambda i: prompts[i], "single": lambda i: single[i], "poe": lambda i: poe[i]}

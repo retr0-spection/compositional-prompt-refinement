@@ -62,7 +62,8 @@ for cfg in CFGS:
                 return kw
             g = torch.Generator("cuda").manual_seed(SEED)
             pipe(prompt=textfn(i), num_inference_steps=STEPS, guidance_scale=cfg,
-                 generator=g, callback_on_step_end=cb,
+                 generator=g, output_type="latent",  # skip pipeline final decode;
+                 callback_on_step_end=cb,             # our callback does the decodes
                  callback_on_step_end_tensor_inputs=["latents"])
 
 with open(OUT / "clip_vs_step.jsonl", "w") as f:
