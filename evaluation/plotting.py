@@ -1233,6 +1233,38 @@ def plot_embedding_pca(output_root: Path, out_dir: Path,
     _save(fig, out_dir, "rq1_embedding_pca")
 
 
+def plot_steerability(rq6_dir: Path, out_dir: Path) -> None:
+    """
+    RQ6 steerability: mean |delta CLIPScore| between adjacent tunability-grid
+    cells along each axis (image layer vs LLaDA layer). Low values on both axes
+    indicate a near-flat quality surface, i.e. the step counts barely steer
+    quality, which complements the CFG-saturation finding. Reads
+    rq6/steerability.json.
+    """
+    import json as _json, numpy as np
+    plt = _style()
+    f = Path(rq6_dir) / "steerability.json"
+    if not f.is_file():
+        logger.info("No steerability.json — skipping steerability plot.")
+        return
+    d = _json.loads(f.read_text())
+    vals = [d.get("image_axis_steerability"), d.get("llada_axis_steerability")]
+    if any(v is None for v in vals):
+        logger.info("steerability.json missing fields — skipping steerability plot.")
+        return
+    labels = ["Image layer", "LLaDA layer"]
+    fig, ax = plt.subplots(figsize=(5, 4.2))
+    x = np.arange(len(labels))
+    ax.bar(x, vals, color=["#4B3FCE", "#1D7A63"], width=0.55)
+    for xi, v in zip(x, vals):
+        ax.text(xi, v, f"{v:.4f}", ha="center", va="bottom", fontsize=10)
+    ax.set_xticks(x); ax.set_xticklabels(labels)
+    ax.set_ylabel("Mean |delta CLIPScore| per adjacent cell")
+    ax.set_title("RQ6 — steerability by tunability axis")
+    ax.set_ylim(0, max(vals) * 1.35)
+    _save(fig, out_dir, "rq6_steerability")
+
+
 def generate_all_plots(
     output_root: str | Path = "outputs",
     rq3_results: Optional[dict] = None,
@@ -1310,6 +1342,8 @@ def generate_all_plots(
     # heatmaps, which understated the flat CLIPScore surface).
     plot_rq6_cfg_saturation(root / "rq6", plot_dir)
     plot_rq6_time(root / "rq6", plot_dir)
+    # RQ6 steering: how much quality moves per step along each tunability axis.
+    plot_steerability(root / "rq6", plot_dir)
     # RQ6 tunability IMAGE grid (the visual figure).
     plot_tunability_image_grid(root / "rq6", plot_dir)
     # Multi-CFG denoising trajectory line graphs (if cfg_stability ran).
