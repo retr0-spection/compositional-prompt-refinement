@@ -21,7 +21,7 @@ from evaluation.metrics import CLIPScorer
 
 MODEL = "stabilityai/stable-diffusion-xl-base-1.0"
 STEPS = 50
-CFG_GRID = [3.0, 5.0, 7.5, 10.0, 12.5, 15.0, 20.0]
+CFG_GRID = [3.0, 5.0, 7.5, 10.0, 12.5, 15.0, 20.0, 25.0, 30.0, 40.0, 50.0]  # 20+ = overshoot tail: robustness in the oversaturation regime
 SEED = 42
 N_PROMPTS = 15
 OUT = Path("outputs/sdxl/diagnostics")
