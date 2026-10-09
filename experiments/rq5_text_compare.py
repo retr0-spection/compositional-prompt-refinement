@@ -181,8 +181,41 @@ def run_text_compare(
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    pairs_path = output_dir / "text_pairs.jsonl"
+
+    # Resume: load prompts already computed by a previous (possibly timed-out)
+    # run so their expensive LLaDA rewrites are not recomputed. Records are
+    # appended and flushed as each prompt completes, so a wall-clock timeout
+    # keeps every finished prompt on disk and the next submission continues.
+    cached: dict[str, dict] = {}
+    if pairs_path.exists():
+        for line in pairs_path.open(encoding="utf-8"):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                r = json.loads(line)
+            except Exception:
+                continue
+            if isinstance(r, dict) and "prompt" in r:
+                cached[r["prompt"]] = r
+        if cached:
+            logger.info("[rq5-text] resuming: %d prompts already cached", len(cached))
+
     records: list[dict] = []
+    f = open(pairs_path, "a", encoding="utf-8")
     for i, prompt in enumerate(prompts):
+        if prompt in cached:
+            rec = dict(cached[prompt])
+            rec["idx"] = i
+            # _typed is not persisted; recompute it cheaply for the image stage
+            try:
+                rec["_typed"] = _typed_constraints(prompt, extractor)[1]
+            except Exception:
+                rec["_typed"] = []
+            records.append(rec)
+            continue
+
         constraints, typed = _typed_constraints(prompt, extractor)
         logger.info("[rq5-text] %d/%d: %r -> %d constraints",
                     i + 1, len(prompts), prompt[:50], len(constraints))
@@ -196,25 +229,24 @@ def run_text_compare(
         s_tok, p_tok = set(single_text.lower().split()), set(poe_text.lower().split())
         divergence = (len(s_tok ^ p_tok) / len(s_tok | p_tok)) if (s_tok | p_tok) else 0.0
 
-        records.append({
+        rec = {
             "idx": i,
             "prompt": prompt,
             "n_constraints": len(constraints),
             "constraints": [c["text"] for c in typed],
             "constraint_types": [c["type"] for c in typed],
-            "_typed": typed,   # full typed records, for reuse by the image stage
             "single_text": single_text,
             "poe_text": poe_text,
             "divergence": divergence,
             "single": single_cov,
             "poe": poe_cov,
-        })
-
-    # persist per-prompt records (drop _typed from disk to keep it readable)
-    with open(output_dir / "text_pairs.jsonl", "w", encoding="utf-8") as f:
-        for r in records:
-            disk = {k: v for k, v in r.items() if k != "_typed"}
-            f.write(json.dumps(disk, ensure_ascii=False) + "\n")
+        }
+        # persist immediately (without _typed) so a timeout keeps progress
+        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        f.flush()
+        rec["_typed"] = typed   # kept in memory for the image stage this run
+        records.append(rec)
+    f.close()
 
     def _mean(cond, key):
         vals = [r[cond][key] for r in records

@@ -20,6 +20,11 @@ set -a; [[ -f "${REPO_ROOT}/.env" ]] && source "${REPO_ROOT}/.env"; set +a
 export OMP_NUM_THREADS=8
 export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128
 export PYTHONFAULTHANDLER=1
+# Compute nodes run with an unset locale (ASCII default), which makes Python's
+# open()/print() crash on non-ASCII chars (em-dashes, LLaDA output). Force UTF-8.
+export LANG=C.UTF-8
+export LC_ALL=C.UTF-8
+export PYTHONIOENCODING=utf-8
 
 echo "========================================"
 echo "Job      : $SLURM_JOB_ID"
@@ -33,14 +38,80 @@ nvidia-smi
 [[ -n "${WANDB_API_KEY:-}" ]] && \
     python -c "import wandb; wandb.login(key='${WANDB_API_KEY}', relogin=True)" 2>/dev/null || true
 
-# Run all pipelines sequentially in this single job
-PIPELINE_NAMES=("raw_clip" "ar_clip" "llada_clip")
-for PIPELINE_NAME in "${PIPELINE_NAMES[@]}"; do
+# Run pipelines according to RQ needs:
+#   RQ1-3: each pipeline is independent, run them as separate processes
+#          (lets a single failure not kill the others; summaries merge via
+#           per-pipeline JSON sidecars).
+#   RQ4-6: run once in ONE process (RQ4 = mechanism comparison needs both AR+
+#          LLaDA; RQ5 = PoE builds its own 4 conditions; RQ6 = tunability grid).
+#
+# BACKBONE (env var, default sd21) selects the T2I backbone. We override ALL
+# backbone-coupled config fields together (not just backbone) so the yaml's
+# committed SDXL model_id/resolution/prediction_type don't leak into an sd21
+# run — that mismatch loads SDXL weights into the SD2.1 pipeline and crashes
+# with 'added_cond_kwargs is None'. run_experiment.py scopes output to
+# outputs/<backbone>/ automatically.
+BACKBONE="${BACKBONE:-sd21}"
+echo "Backbone: $BACKBONE"
+if [[ "$BACKBONE" == "sdxl" ]]; then
+    BACKBONE_OVERRIDE=(--config t2i.backbone=sdxl
+                       t2i.model_id=stabilityai/stable-diffusion-xl-base-1.0
+                       t2i.resolution=1024 t2i.prediction_type=epsilon)
+else
+    BACKBONE_OVERRIDE=(--config t2i.backbone=sd21
+                       t2i.model_id=sd2-community/stable-diffusion-2-1
+                       t2i.resolution=768 t2i.prediction_type=v_prediction)
+fi
+
+if [[ "$RQ" == "4" || "$RQ" == "5" || "$RQ" == "6" ]]; then
     echo ""
-    echo "--- Pipeline: $PIPELINE_NAME ---"
+    echo "--- RQ${RQ}: single-process run (backbone=$BACKBONE) ---"
+
+    # RQ5 needs Ollama LIVE (scene-graph decomposition + coverage scoring via
+    # the SemanticExtractor, AND ar_rewriter for the AR condition on the new
+    # rq5_compositional prompts, which aren't in the warmup cache). The other
+    # RQs read only cached rewrites, so they don't. Start Ollama for RQ5.
+    OLLAMA_PID=""
+    if [[ "$RQ" == "5" ]]; then
+        OLLAMA_BIN="${OLLAMA_BIN:-$HOME/ollama-dist/bin/ollama}"
+        if [[ -x "$OLLAMA_BIN" ]]; then
+            echo "Starting Ollama for RQ5 (decomposition + AR rewrites)..."
+            "$OLLAMA_BIN" serve & OLLAMA_PID=$!
+            for i in $(seq 1 30); do
+                curl -sf http://localhost:11434/api/tags >/dev/null 2>&1 && break
+                if ! kill -0 "$OLLAMA_PID" 2>/dev/null; then
+                    echo "FATAL: Ollama died during startup." >&2; exit 1
+                fi
+                sleep 2
+            done
+            echo "Ollama ready (PID $OLLAMA_PID)."
+        else
+            echo "FATAL: RQ5 needs Ollama but binary not found at $OLLAMA_BIN" >&2
+            exit 1
+        fi
+    fi
+
     python experiments/run_experiment.py \
         --rq "$RQ" \
-        --pipeline "$PIPELINE_NAME" \
-        --seed "${SEED:-42}"
-done
-echo "All pipelines complete for RQ${RQ}."
+        --seed "${SEED:-42}" \
+        "${BACKBONE_OVERRIDE[@]}"
+
+    [[ -n "$OLLAMA_PID" ]] && kill "$OLLAMA_PID" 2>/dev/null || true
+else
+    PIPELINE_NAMES=("raw_clip" "ar_clip" "llada_clip")
+    for PIPELINE_NAME in "${PIPELINE_NAMES[@]}"; do
+        echo ""
+        echo "--- Pipeline: $PIPELINE_NAME (backbone=$BACKBONE) ---"
+        python experiments/run_experiment.py \
+            --rq "$RQ" \
+            --pipeline "$PIPELINE_NAME" \
+            --seed "${SEED:-42}" \
+            "${BACKBONE_OVERRIDE[@]}"
+    done
+fi
+echo "All pipelines complete for RQ${RQ} (backbone=$BACKBONE)."
+
+# Regenerate all plots from disk artifacts, scoped to this backbone's outputs.
+echo ""
+echo "--- Regenerating plots (outputs/${BACKBONE}) ---"
+python -m evaluation.plotting "outputs/${BACKBONE}" || echo "WARN: plotting step failed (non-fatal)."

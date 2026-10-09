@@ -302,10 +302,20 @@ def parse_spatial_relations(prompt: str) -> list[tuple[str, str, str]]:
             if w and w not in _ARTICLES:
                 subj = w
                 break
-        # Object: first non-article word after the relation
-        after = p[m.end():].strip().split()
+        # Object: HEAD NOUN of the object noun phrase after the relation.
+        # The NP head is its LAST word (mirrors the subject rule), e.g.
+        # "a blue dog" -> "dog", not the adjective "blue". Bound the NP at
+        # the next spatial relation / comma so a chained prompt
+        # ("... a green frog in a brown pond") takes "frog", not "pond".
+        after_full = p[m.end():]
+        cut = len(after_full)
+        for _r2 in _SPATIAL_RELATIONS:
+            _mm = re.search(r"\b" + re.escape(_r2) + r"\b", after_full)
+            if _mm is not None:
+                cut = min(cut, _mm.start())
+        after_seg = re.split(r"[.,;]", after_full[:cut])[0].strip().split()
         obj = ""
-        for w in after:
+        for w in reversed(after_seg):
             w = w.strip(".,;")
             if w and w not in _ARTICLES:
                 obj = w
