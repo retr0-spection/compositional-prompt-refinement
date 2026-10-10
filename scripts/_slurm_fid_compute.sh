@@ -13,4 +13,4 @@ conda activate prompt-pipeline
 export LANG=C.UTF-8 LC_ALL=C.UTF-8 PYTHONIOENCODING=utf-8
 echo "node: $(hostname)"
 export PYTHONPATH="${SLURM_SUBMIT_DIR}:${PYTHONPATH:-}"
-python experiments/compute_fid.py fid_ref/val2017
+python experiments/compute_fid.py /datasets/onailana/coco/val2017
